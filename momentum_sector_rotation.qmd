@@ -1,0 +1,1593 @@
+---
+title: "Momentum-Driven Sector Rotation via Kalman Filtering and Unsupervised Clustering"
+subtitle: "FIN452 Quantitative Trading Project"
+author: "Carter Vereschagin"
+date: today
+format:
+  html:
+    embed-resources: true
+    toc: true
+    toc-depth: 3
+    toc-float: true
+    theme: flatly
+    code-fold: true
+    code-summary: "Show code"
+    fig-width: 10
+    fig-height: 6
+    df-print: paged
+    number-sections: true
+execute:
+  echo: true
+  warning: false
+  message: false
+  cache: false
+---
+
+```{r}
+#| label: setup
+#| include: false
+
+# --- Data & Finance ---
+library(tidyquant)          # tq_get() — Yahoo Finance wrapper
+library(TTR)                # RSI(), MACD(), BBands()
+library(xts)                # time-series objects
+library(quantmod)           # chartSeries(), addBBands(), addRSI(), addMACD()
+library(PerformanceAnalytics) # charts.PerformanceSummary(), maxDrawdown(), SharpeRatio.annualized()
+
+# --- Kalman Filter ---
+library(dlm)                # dlmModPoly(), dlmFilter()
+
+# --- Tidymodels Ecosystem ---
+library(tidymodels)         # recipe(), workflow(), fit(), augment()
+library(tidyclust)          # k_means(), extract_cluster_assignment()
+
+# --- Parallelism ---
+library(doParallel)         # makeCluster(), registerDoParallel()
+library(foreach)            # foreach() %:% %dopar%
+
+# --- Visualization ---
+library(plotly)             # 3D surface charts
+library(ggplot2)
+library(patchwork)
+library(scales)
+
+# --- Data Wrangling ---
+library(dplyr)
+library(tidyr)
+library(purrr)
+library(lubridate)
+library(tibble)
+library(zoo)
+
+# --- Display ---
+library(knitr)
+library(kableExtra)
+
+# Resolve namespace conflicts (prefer tidymodels versions)
+tidymodels_prefer()
+
+# Global options
+options(scipen = 999)
+theme_set(theme_minimal(base_size = 12))
+
+# ─── Global Constants ──────────────────────────────────────────────────────────
+TRAIN_START    <- as.Date("2000-06-01")
+TRAIN_END      <- as.Date("2024-12-31")
+TEST_START     <- as.Date("2025-01-01")
+TEST_END       <- as.Date("2026-03-31")
+
+# Add buffer for indicator warm-up (126 trading days ~ 6 months)
+DOWNLOAD_START <- TRAIN_START - 200
+
+TC_RATE        <- 0.0005   # 0.05% one-way transaction cost
+
+# All symbols (SPY = benchmark; remaining 11 = sectors)
+SYMBOLS        <- c("SPY","XLB","XLC","XLE","XLF","XLI",
+                    "XLK","XLP","XLRE","XLV","XLU","XLY")
+SECTOR_SYMBOLS <- setdiff(SYMBOLS, "SPY")
+
+# Kalman default parameters (overridden by optimised values later)
+DEFAULT_Q_LEVEL    <- 0.01
+DEFAULT_Q_VELOCITY <- 0.001
+DEFAULT_R_OBS      <- 1.0
+DEFAULT_K          <- 3     # default number of clusters
+
+# Features fed into k-means
+FEATURE_COLS <- c("kal_velocity", "rsi14", "macd_kal",
+                  "bb_zscore", "ret_1m", "ret_3m", "ret_6m")
+
+# Known ETF launch dates (important for data coverage disclosure)
+XLC_LAUNCH  <- as.Date("2018-06-18")
+XLRE_LAUNCH <- as.Date("2015-10-07")
+```
+
+---
+
+# Executive Summary
+
+This project implements a **daily momentum-driven sector rotation strategy** applied to the eleven S&P 500 Select Sector SPDR ETFs (XLB, XLC, XLE, XLF, XLI, XLK, XLP, XLRE, XLV, XLU, XLY), benchmarked against SPY. The strategy operates as follows: each trading day at market close, a **Kalman Filter** is applied to each sector's price history to extract a noise-filtered trend velocity. This velocity, alongside four families of technical indicators (RSI, Kalman-smoothed MACD, Bollinger Band z-score, and multi-horizon momentum returns), feeds into a **k-means clustering model** that classifies each sector into a market regime. Sectors assigned to the "Bull" cluster receive equal-weight long positions, executed at the following day's market open. The model is trained on data from June 2000 through December 2024, with parameter optimization conducted in parallel using `doParallel`. Out-of-sample evaluation covers January 2025 through March 2026. All code follows the `tidymodels` ecosystem with `tidyclust` for unsupervised learning.
+
+---
+
+# Introduction & Hypothesis
+
+## Sector Rotation and the Business Cycle
+
+Equity markets do not move uniformly across sectors. The business cycle theory (Fama & French, 1989; Stovall, 1996) proposes that different sectors tend to outperform at different stages of the economic cycle:
+
+| Cycle Phase | Typically Outperforming Sectors |
+|---|---|
+| Early Expansion | XLF (Financials), XLY (Consumer Discretionary) |
+| Mid Expansion | XLI (Industrials), XLK (Technology), XLC (Communication) |
+| Late Expansion | XLE (Energy), XLB (Materials) |
+| Contraction / Defensive | XLU (Utilities), XLP (Consumer Staples), XLV (Health Care) |
+
+A sector rotation strategy attempts to be positioned in the sectors most likely to outperform during the current phase of the cycle.
+
+## Academic Foundation
+
+Moskowitz & Grinblatt (1999) documented that industry-level momentum — the tendency for recently outperforming industries to continue outperforming — is statistically significant and economically meaningful. Jegadeesh & Titman (1993) demonstrated cross-sectional momentum at the stock level. Faber (2007) applied these insights to sector ETFs, showing that simple trend-following rules on sector ETFs can produce risk-adjusted returns superior to buy-and-hold.
+
+## Strategy Innovation
+
+This project extends the simple rank-based momentum approach in two key ways:
+
+1. **Kalman Filtering**: Instead of using raw price returns, a Kalman Filter is applied to extract the underlying "true" trend velocity for each sector, removing day-to-day noise and providing a cleaner directional signal.
+
+2. **Unsupervised Clustering**: Rather than a fixed ranking rule, the strategy uses k-means clustering to classify sectors into distinct market regimes based on a multi-dimensional feature space. This allows the model to discover latent structure in the indicator data, potentially capturing regime dynamics that simple momentum ranking misses.
+
+---
+
+# Mental Model
+
+## Decision Flowchart
+
+The following diagram illustrates the complete daily decision process:
+
+```{mermaid}
+flowchart TD
+    A([Market Close Day T]) --> B[Load OHLCV data\nfor all 12 symbols via tq_get]
+    B --> C[Kalman Filter Update\ndlmFilter — causal forward pass only]
+    C --> D[Extract Price Velocity\nsmoothed slope state — primary signal]
+    D --> E[Compute Technical Indicators\nRSI-14 · MACD 12/26/9 · BB z-score\n1m 3m 6m momentum returns]
+    E --> F[Apply Kalman to MACD histogram\nreduce whipsaws → macd_kal]
+    F --> G[Standardize all 7 features\nz-score via trained recipe]
+    G --> H[Apply frozen k-means model\nAssign cluster to each sector]
+    H --> I{Sector in Bull Cluster?}
+    I -- Yes --> J[LONG signal\n1 ÷ n_bull equal weight per sector]
+    I -- No --> K[FLAT signal\nno position held]
+    J --> L[Compute transaction cost\n0.05% per unit of weight change]
+    K --> L
+    L --> M([Execute at Market Open\nDay T+1])
+    M --> O[Earn Open-to-Close return\nDay T+1]
+    O --> P[Update portfolio P&L]
+    P --> A
+```
+
+## Decision Rules
+
+| Condition | Signal | Execution Timing | Return Captured |
+|---|---|---|---|
+| Sector in "Bull" cluster | LONG | Buy at Open$_{T+1}$ | Open-to-Close of day $T+1$ |
+| Sector not in "Bull" cluster | FLAT | Sell (if held) at Open$_{T+1}$ | None (cash = 0%) |
+| No sectors in "Bull" cluster | 100% Cash | Hold cash | 0% |
+| Portfolio composition changes | Rebalance | At Open$_{T+1}$ | TC deducted at rebalance |
+
+The strategy is **long-only**. Short positions are excluded due to margin requirements, stock availability constraints, and borrow costs (typically 0.5–2% annualized), none of which are trivially modeled (see Section 5.7).
+
+---
+
+# Data
+
+## Symbols and Date Ranges
+
+```{r}
+#| label: data_download
+#| cache: true
+
+# Download all 12 symbols with buffer period for indicator warm-up
+raw_prices <- tq_get(
+  SYMBOLS,
+  get  = "stock.prices",
+  from = DOWNLOAD_START,
+  to   = TEST_END
+)
+
+cat("Download complete.\n")
+cat("Rows:", nrow(raw_prices), "\n")
+cat("Symbols:", paste(unique(raw_prices$symbol), collapse = ", "), "\n")
+cat("Date range:", format(min(raw_prices$date)), "to", format(max(raw_prices$date)), "\n")
+```
+
+## Data Coverage and Quality
+
+```{r}
+#| label: data_quality
+
+coverage <- raw_prices %>%
+  group_by(symbol) %>%
+  summarise(
+    first_date  = min(date),
+    last_date   = max(date),
+    n_rows      = n(),
+    n_na_adj    = sum(is.na(adjusted)),
+    n_na_open   = sum(is.na(open)),
+    .groups     = "drop"
+  ) %>%
+  arrange(first_date)
+
+kable(coverage,
+      col.names = c("Symbol","First Date","Last Date","Rows","NA (Adjusted)","NA (Open)"),
+      caption   = "Table 1: Data Coverage by Symbol",
+      format    = "html") %>%
+  kable_styling(bootstrap_options = c("striped","hover","condensed")) %>%
+  row_spec(which(coverage$symbol %in% c("XLC","XLRE")), background = "#fff3cd")
+```
+
+::: {.callout-note title="ETF Launch Dates"}
+**XLC** (Communication Services) launched `r format(XLC_LAUNCH, "%B %d, %Y")`. No pre-launch data exists and no values are imputed — pre-2018 feature engineering uses 10 sectors, post-2018 uses 11. Similarly, **XLRE** (Real Estate) launched `r format(XLRE_LAUNCH, "%B %d, %Y")`. Missing values in the feature matrix are handled by `step_impute_median()` in the recipe, which replaces NAs with the cross-sectional median computed from training data only.
+:::
+
+::: {.callout-warning title="Adjusted Price Caveat"}
+Yahoo Finance computes `adjusted` close using the **full forward history** of dividends and splits — i.e., the adjustment factor for January 2001 incorporates dividends paid in 2010. This creates a minor look-ahead bias in the feature engineering (momentum signals use adjusted close). This is standard practice in academic finance and is disclosed here. The impact is small for sector ETFs, which pay modest quarterly dividends and rarely split.
+:::
+
+## Data Split
+
+```{r}
+#| label: data_split
+
+# Training data (June 2000 – Dec 2024)
+train_all    <- raw_prices %>% filter(date >= TRAIN_START, date <= TRAIN_END)
+sector_train <- train_all %>% filter(symbol %in% SECTOR_SYMBOLS)
+spy_train    <- train_all %>% filter(symbol == "SPY")
+
+# Testing data (Jan 2025 – Mar 2026)
+test_all    <- raw_prices %>% filter(date >= TEST_START, date <= TEST_END)
+sector_test <- test_all %>% filter(symbol %in% SECTOR_SYMBOLS)
+spy_test    <- test_all %>% filter(symbol == "SPY")
+
+cat("Training rows (sectors):", nrow(sector_train), "\n")
+cat("Testing rows (sectors):", nrow(sector_test), "\n")
+cat("Training date range:", format(min(train_all$date)), "–", format(max(train_all$date)), "\n")
+cat("Testing date range:",  format(min(test_all$date)),  "–", format(max(test_all$date)),  "\n")
+```
+
+> **Look-ahead firewall**: `test_all`, `sector_test`, and `spy_test` are created here but not accessed again until Section 9. All model fitting, parameter selection, and normalization statistics are derived exclusively from training data.
+
+---
+
+# Methodology
+
+## 5.1 Kalman Filter — Extracting Noise-Filtered Trend Velocity
+
+### State-Space Model
+
+The Kalman Filter models a time series as a **hidden Markov process**: the observed daily price is treated as a noisy measurement of an unobserved "true" underlying state. We use a **local level + slope** (second-order polynomial) model:
+
+**State equations**:
+$$\mu_{t+1} = \mu_t + \beta_t + w_{1,t}, \quad w_{1,t} \sim \mathcal{N}(0, Q_1)$$
+$$\beta_{t+1} = \beta_t + w_{2,t}, \quad w_{2,t} \sim \mathcal{N}(0, Q_2)$$
+
+**Observation equation**:
+$$y_t = \mu_t + v_t, \quad v_t \sim \mathcal{N}(0, R)$$
+
+where $\mu_t$ is the underlying price level, $\beta_t$ is the **velocity** (daily rate of change of the underlying trend), and $y_t$ is the observed daily adjusted close price.
+
+### Parameters
+
+- **$Q_1$** (level process noise): controls how quickly the estimated level can change. Larger $Q_1$ allows the filter to track rapid level changes.
+- **$Q_2$** (velocity process noise): controls how quickly the estimated velocity can change. This is the key tuning parameter — larger $Q_2$ allows more volatile trend direction changes.
+- **$R$** (observation noise): represents daily price measurement noise. Fixed at 1.0 relative to process noise.
+
+### Filter vs. Smoother: The Look-Ahead Distinction
+
+The Kalman **filter** (`dlmFilter`) is a **forward-only** algorithm: the state estimate at time $t$ uses only observations $y_1, \ldots, y_t$. This is causal and appropriate for real-time signal generation.
+
+The Kalman **smoother** (`dlmSmooth`) runs a backward pass using $y_{t+1}, \ldots, y_T$ — it produces better state estimates in hindsight but **uses future information**. Using the smoother for signal generation would introduce look-ahead bias and overstate realistic performance. **The smoother is not used anywhere in this analysis.**
+
+### Why Velocity is the Primary Feature
+
+The velocity state $\beta_t$ represents the filtered estimate of the sector's daily trend momentum. A **positive and increasing velocity** indicates a strengthening uptrend; a **negative velocity** signals a downtrend. Unlike raw daily returns, the Kalman velocity is robust to single-day outliers and temporary reversals, providing a more stable directional signal for clustering.
+
+## 5.2 Technical Indicators
+
+Four indicator families complement the Kalman velocity signal:
+
+**Relative Strength Index (RSI-14)**: Bounded [0, 100], measuring the speed and magnitude of recent price movements. Values > 70 suggest overbought conditions (potential exhaustion); values < 30 suggest oversold. RSI captures *saturation* — how "stretched" a trend is — which momentum signals alone miss.
+
+**MACD Histogram (Kalman-smoothed)**: The MACD histogram (12-day EMA minus 26-day EMA, minus the 9-day signal line) captures **trend acceleration**. A positive and growing histogram indicates strengthening upward momentum; a declining histogram signals momentum deterioration. We apply a secondary Kalman filter (with tighter observation noise, $R=0.1$) to the histogram to reduce false crossovers that would otherwise trigger unnecessary trades. The resulting smoothed series is `macd_kal`.
+
+**Bollinger Band Z-Score**: $(P_t - \text{SMA}_{20}) / \sigma_{20}$, where $\sigma_{20}$ is the 20-day rolling standard deviation. This simultaneously captures **volatility regime** (wide bands = high volatility) and **price position** relative to recent history. A z-score of +2 means the price is 2 standard deviations above its 20-day mean — potentially overbought or in a strong breakout.
+
+**Multi-Horizon Momentum Returns** (1-month, 3-month, 6-month): Rolling cumulative returns at 21, 63, and 126 trading days. These capture trend persistence at different time horizons. The 1-month return identifies recent catalysts; the 6-month return identifies sustained trends.
+
+### Complementarity of the Feature Space
+
+Together, these five feature families span the key dimensions of sector market dynamics:
+
+| Dimension | Features |
+|---|---|
+| Trend direction | `kal_velocity`, `ret_1m`, `ret_3m`, `ret_6m` |
+| Trend strength / acceleration | `macd_kal` |
+| Trend saturation | `rsi14` |
+| Volatility regime | `bb_zscore` |
+
+## 5.3 Feature Engineering Pipeline
+
+```{mermaid}
+flowchart LR
+    subgraph DATA ["Data: tq_get OHLCV"]
+        D1["Daily adjusted close\n+ open prices\n12 symbols"]
+    end
+    subgraph KALMAN ["Kalman Filter: dlm"]
+        K1["dlmModPoly order=2\nlevel + slope"] --> K2["dlmFilter\ncausal forward pass"]
+        K2 --> K3["kal_velocity\nfiltered slope state"]
+        K2 --> K4["Apply to MACD hist\n→ macd_kal"]
+    end
+    subgraph TECH ["Technical Indicators: TTR"]
+        I1["RSI 14-day"]
+        I2["BB z-score 20-day"]
+        I3["1m · 3m · 6m returns"]
+    end
+    subgraph RECIPE ["tidymodels Recipe"]
+        R1["step_impute_median\nhandle XLC/XLRE gaps"] --> R2["step_normalize\nz-score all features"]
+    end
+    subgraph CLUSTER ["tidyclust k-means"]
+        C1["k_means num_clusters=k\nfit on training data"] --> C2["Inspect centroids\nlabel BULL_CLUSTER"]
+        C2 --> C3["augment on test data\nfrozen model + training stats"]
+    end
+    subgraph SIGNAL ["Signal & Portfolio"]
+        S1["Bull → LONG\nequal weight"] --> S2["Execute at Open T+1\nearn O2C return"]
+        S2 --> S3["Apply 0.05% TC\nper weight change"]
+    end
+    subgraph OPT ["Parallel Optimization"]
+        O1["Grid: k=2–6\nQ=4 log-spaced values"] --> O2["3D Omega surface\nplotly"]
+        O2 --> O3["Select optimal k, Q\ntraining data only"]
+    end
+    subgraph EVAL ["Evaluation"]
+        E1["Omega · Sharpe · MaxDD\n%Win · %InMkt · #Trades"] --> E2["Z-scored for grid viz"]
+        E2 --> E3["Stress tests\n2×TC · no-GFC · no-COVID"]
+    end
+    DATA --> KALMAN & TECH
+    KALMAN & TECH --> RECIPE
+    RECIPE --> CLUSTER --> SIGNAL --> OPT --> EVAL
+```
+
+## 5.4 K-Means Clustering Theory
+
+K-means partitions $n$ observations into $k$ clusters by minimizing the **within-cluster sum of squares (WCSS)**:
+
+$$\underset{S}{\arg\min} \sum_{i=1}^{k} \sum_{\mathbf{x} \in S_i} \|\mathbf{x} - \boldsymbol{\mu}_i\|^2$$
+
+where $S_i$ is the $i$-th cluster and $\boldsymbol{\mu}_i$ is its centroid. Each observation (a sector on a given day, described by its 7 features) is assigned to the cluster whose centroid is nearest in Euclidean distance.
+
+**Critical**: Euclidean distance is scale-dependent. Features with larger numerical ranges dominate the distance calculation unless all features are standardized. The recipe's `step_normalize()` converts every feature to zero mean and unit standard deviation, ensuring equal contribution.
+
+The number of clusters $k$ is a hyperparameter optimized via parallel parameter grid search (Section 7).
+
+## 5.5 Trade Execution Timing and Return Types
+
+The timing convention is fundamental to a realistic backtest:
+
+```
+Day T [Close]:  Compute 7 features → assign cluster → generate LONG/FLAT signal
+Day T+1 [Open]: Execute trade at market open price
+Day T+1 [Close]: Position exited at close (or held overnight if signal unchanged)
+```
+
+Three return types are computed and reported:
+
+| Return Type | Formula | Interpretation |
+|---|---|---|
+| **Close-to-Close (C2C)** | $\frac{\text{Adj}_{t}}{\text{Adj}_{t-1}} - 1$ | Full 24-hour return; used for passive SPY benchmark |
+| **Open-to-Close (O2C)** | $\frac{\text{Close}_{t}}{\text{Open}_{t}} - 1$ | Intraday return; **strategy earns this** when entering at open |
+| **Close-to-Open (C2O)** | $\frac{\text{Open}_{t}}{\text{Close}_{t-1}} - 1$ | Overnight gap return; exposes overnight risk |
+
+Note: O2C and C2O use **raw (unadjusted)** close and open prices, which more accurately represent actual execution. C2C uses **adjusted** close for backward-compatible trend comparisons. This distinction is disclosed.
+
+**Strategy return on day $T+1$**: the sector earns its O2C return ($\frac{\text{Close}_{T+1}}{\text{Open}_{T+1}} - 1$), as the position is entered at open and held to close.
+
+## 5.6 Transaction Costs
+
+| Component | Assumption | Rationale |
+|---|---|---|
+| Bid-ask spread (one-way) | 0.03% | Liquid sector ETFs trade with ~0.01-0.05% spreads |
+| Commission | 0.02% | Conservative estimate; many brokers now charge $0 |
+| **Total (one-way)** | **0.05%** | Applied as $|\Delta w_i| \times 0.0005$ per dollar rebalanced |
+| Cash return | 0% | Conservative; money market rates not credited |
+| Short sale constraints | N/A | Long-only strategy; no short positions |
+
+Total round-trip cost per sector entry/exit: **0.10%**. Results are reported both gross and net of transaction costs.
+
+## 5.7 Common Pitfalls in Algorithmic Backtesting
+
+::: {.callout-warning title="Pitfall 1: Survivorship Bias"}
+All 11 sector ETFs used in this analysis currently exist and are actively traded. Any sector fund that might have been discontinued, merged, or restructured over the 25-year sample period is absent. This overstates the investable universe and may create a subtle upward bias. For sector SPDRs specifically, all 11 have existed since at least 2015 (XLC since 2018), reducing but not eliminating this concern.
+:::
+
+::: {.callout-warning title="Pitfall 2: Look-Ahead Bias"}
+Look-ahead bias — using information from the future to make decisions in the past — is one of the most insidious and common errors in backtesting. This analysis addresses it at multiple levels: (1) signals are generated at Close$_T$ and executed at Open$_{T+1}$; (2) `dlmFilter()` processes data sequentially (no future observations used); (3) `step_normalize()` parameters (mean, SD) are computed from training data only and applied identically to test data; (4) all rolling indicators use `dplyr::lag()` to reference past observations only; (5) parameter optimization uses training data exclusively — the test set is sealed until final evaluation.
+:::
+
+::: {.callout-warning title="Pitfall 3: Data Mining and Parameter Snooping"}
+This analysis optimizes two parameters (number of clusters $k$ and Kalman velocity process noise $Q$) over a grid of 20 combinations. Each combination tried on training data represents a "look" at the data, increasing the probability that the selected parameter combination is coincidentally optimal for the training history rather than genuinely predictive. The 3D surface plot (Section 7) reveals whether the optimum is a broad plateau (more robust) or a sharp peak (likely overfit). The test period is used exactly once — for final evaluation — and its results are reported honestly regardless of outcome.
+:::
+
+::: {.callout-warning title="Pitfall 4: Storytelling and Narrative Fitting"}
+It is tempting to construct a post-hoc narrative for why the strategy worked (or failed) in specific periods. The sector attribution charts in Section 9 are descriptive — they explain what happened but do not validate the strategy's forward-looking logic. Results are reported for the complete out-of-sample period without excluding adverse sub-periods. The reader should interpret the strategy as one candidate approach among many, not a validated causal relationship.
+:::
+
+::: {.callout-warning title="Pitfall 5: Transaction Costs"}
+Theoretical strategies that ignore transaction costs systematically overstate performance. High-frequency rotation among 11 ETFs generates many round-trips. This analysis applies a 0.05% one-way cost, reflecting realistic mid-market execution for liquid ETFs. Section 11 stress tests with 2× costs (0.10% one-way) to assess sensitivity. Results are shown both gross and net of costs.
+:::
+
+::: {.callout-warning title="Pitfall 6: Adjusted Historical Prices"}
+Yahoo Finance's adjusted close prices are constructed using the full historical record of dividends and splits — including those that occurred after the date being adjusted. This means the adjusted price on January 3, 2005 incorporates information about dividends paid in 2010, 2015, and 2024. This is a mild but real form of look-ahead bias. It is standard practice in academic backtesting (all major academic datasets use similar adjustments) and the magnitude of the effect is small for diversified sector ETFs. It is disclosed here for completeness.
+:::
+
+::: {.callout-warning title="Pitfall 7: Short Selling Constraints"}
+The strategy is long-only. When clustering identifies a "Bear" regime, the strategy simply goes to cash rather than establishing short positions. In practice, shorting ETFs requires: (a) locating shares to borrow, (b) paying borrow fees (typically 0.5–2% annualized for liquid ETFs, higher for crowded shorts), and (c) maintaining adequate margin. These costs and constraints are non-trivial. Any analysis that assumes costless unlimited shorting would significantly overstate achievable returns.
+:::
+
+::: {.callout-warning title="Pitfall 8: Outliers and Tail Events"}
+The 25-year training period includes several extreme events: the dot-com crash (2000–2002), the Global Financial Crisis (2008–2009), the COVID-19 shock (March 2020), and the 2022 rate hike selloff. Single-day returns of ±5–12% occur during these periods. Such outliers can distort cluster centroids and k-means assignments. Clustering features are winsorized at the 1st and 99th percentile before model fitting to reduce outlier influence. Performance metrics are computed on un-winsorized returns to accurately reflect risk.
+:::
+
+::: {.callout-warning title="Pitfall 9: Backtests Are Not Scientific Experiments"}
+A well-designed scientific experiment has a control group, random assignment, and reproducibility. Backtests have none of these. The market is a non-stationary, adaptive system: strategies that work in one regime may fail in another, and widespread adoption of a strategy changes the dynamics that made it profitable. The stress testing in Section 11 approximates robustness analysis but cannot substitute for true forward-looking evidence. Past results are presented as hypothesis-generating, not hypothesis-confirming.
+:::
+
+---
+
+# Implementation
+
+## Helper Functions
+
+```{r}
+#| label: helper_functions
+
+# ─── Kalman Filter ─────────────────────────────────────────────────────────────
+run_kalman <- function(price_vec, q_level = DEFAULT_Q_LEVEL,
+                        q_velocity = DEFAULT_Q_VELOCITY, r_obs = DEFAULT_R_OBS) {
+  # Local level + slope state-space model
+  # State: [level, velocity]; Observation: price
+  # IMPORTANT: uses dlmFilter (causal), NOT dlmSmooth (uses future data)
+  mod  <- dlmModPoly(order = 2, dV = r_obs, dW = c(q_level, q_velocity))
+  filt <- dlmFilter(price_vec, mod)
+  # filt$m is (n+1) x 2: row 1 = prior state; rows 2:(n+1) = posterior after each obs
+  tibble(
+    level    = filt$m[-1, 1],  # filtered level aligned with price_vec
+    velocity = filt$m[-1, 2]   # filtered velocity (daily rate of change of level)
+  )
+}
+
+# ─── Omega Ratio ───────────────────────────────────────────────────────────────
+# Non-parametric risk-reward measure; accounts for all moments of the distribution
+# Omega > 1: expected gains exceed expected losses at threshold t
+# More robust than Sharpe when return distribution is non-normal
+omega_ratio <- function(returns, threshold = 0) {
+  r <- returns[!is.na(returns)]
+  excess <- r - threshold
+  gains  <- sum(excess[excess > 0])
+  losses <- abs(sum(excess[excess < 0]))
+  if (losses == 0) return(Inf)
+  gains / losses
+}
+
+# ─── Signal Generation ─────────────────────────────────────────────────────────
+generate_signals <- function(assignments_df, bull_cluster_id) {
+  assignments_df %>%
+    mutate(signal = if_else(.pred_cluster == bull_cluster_id, "LONG", "FLAT")) %>%
+    select(symbol, date, signal, .pred_cluster)
+}
+
+# ─── Portfolio Construction ────────────────────────────────────────────────────
+# TIMING: signal at date T → execution date T+1 (lead(date)) → earn O2C return of T+1
+build_portfolio <- function(signals_df, returns_df, tc_rate = TC_RATE) {
+
+  # Shift signal date by one trading day (lead within each symbol group)
+  signals_shifted <- signals_df %>%
+    group_by(symbol) %>%
+    arrange(date, .by_group = TRUE) %>%
+    mutate(exec_date = dplyr::lead(date, 1)) %>%
+    ungroup() %>%
+    filter(!is.na(exec_date)) %>%
+    rename(signal_date = date, date = exec_date)
+
+  # Count bull-cluster sectors each execution day
+  bull_counts <- signals_shifted %>%
+    filter(signal == "LONG") %>%
+    group_by(date) %>%
+    summarise(n_long = n(), .groups = "drop")
+
+  # Compute equal weights
+  weights <- signals_shifted %>%
+    left_join(bull_counts, by = "date") %>%
+    mutate(
+      n_long = replace_na(n_long, 0),
+      weight = if_else(signal == "LONG" & n_long > 0, 1 / n_long, 0)
+    ) %>%
+    # Transaction costs: 0.05% per unit of absolute weight change
+    group_by(symbol) %>%
+    arrange(date, .by_group = TRUE) %>%
+    mutate(tc_cost = abs(weight - dplyr::lag(weight, default = 0)) * tc_rate) %>%
+    ungroup()
+
+  # Compute portfolio-level daily returns (Open-to-Close of execution day)
+  weights %>%
+    left_join(returns_df %>% select(symbol, date, o2c_ret), by = c("symbol", "date")) %>%
+    group_by(date) %>%
+    summarise(
+      port_ret_gross = sum(weight * replace_na(o2c_ret, 0), na.rm = TRUE),
+      total_tc       = sum(tc_cost, na.rm = TRUE),
+      n_positions    = sum(weight > 0),
+      .groups        = "drop"
+    ) %>%
+    mutate(port_ret_net = port_ret_gross - total_tc)
+}
+
+# ─── Performance Metrics ───────────────────────────────────────────────────────
+compute_metrics <- function(port_ret_vec, spy_ret_vec = NULL, n_sectors = 11,
+                            label = "", tc_rate = TC_RATE) {
+  r    <- port_ret_vec[!is.na(port_ret_vec)]
+  n    <- length(r)
+  ann  <- 252
+
+  cagr    <- prod(1 + r)^(ann / n) - 1
+  sr      <- if (sd(r) > 0) mean(r) / sd(r) * sqrt(ann) else NA_real_
+  om      <- omega_ratio(r)
+  cum_r   <- cumprod(1 + r)
+  peak    <- cummax(cum_r)
+  dds     <- (cum_r - peak) / peak
+  max_dd  <- min(dds)
+  in_dd   <- dds < -1e-8
+  dd_rle  <- rle(in_dd)
+  dd_lens <- dd_rle$lengths[dd_rle$values]
+  max_dd_len <- if (length(dd_lens) > 0) max(dd_lens) else 0L
+  pct_win    <- mean(r > 0, na.rm = TRUE)
+
+  cor_spy <- if (!is.null(spy_ret_vec)) {
+    s <- na.omit(cbind(r, spy_ret_vec[seq_along(r)]))
+    cor(s[, 1], s[, 2])
+  } else NA_real_
+
+  tibble(
+    Period          = label,
+    `CAGR (%)`      = round(cagr * 100, 2),
+    `Sharpe`        = round(sr, 3),
+    `Omega`         = round(om, 3),
+    `Max DD (%)`    = round(max_dd * 100, 2),
+    `Max DD (days)` = max_dd_len,
+    `% Win`         = round(pct_win * 100, 1),
+    `Cor SPY`       = round(cor_spy, 3)
+  )
+}
+```
+
+## Feature Engineering
+
+### Kalman Filter Applied to Sector Prices
+
+```{r}
+#| label: apply_kalman_train
+#| cache: true
+
+apply_kalman <- function(df, q_vel = DEFAULT_Q_VELOCITY) {
+  kal <- run_kalman(df$adjusted, q_velocity = q_vel)
+  df %>% mutate(kal_level = kal$level, kal_velocity = kal$velocity)
+}
+
+kalman_train <- sector_train %>%
+  group_by(symbol) %>%
+  arrange(date, .by_group = TRUE) %>%
+  group_modify(~ apply_kalman(.x)) %>%
+  ungroup()
+
+cat("Kalman filter applied to", n_distinct(kalman_train$symbol), "sectors.\n")
+```
+
+### Technical Indicators
+
+```{r}
+#| label: compute_indicators_fn
+
+compute_indicators <- function(df) {
+  price  <- df$adjusted
+  cl_raw <- df$close
+  op_raw <- df$open
+  n      <- nrow(df)
+
+  # --- RSI 14-day ---
+  rsi14 <- TTR::RSI(price, n = 14)
+
+  # --- MACD histogram (12/26/9) ---
+  macd_raw  <- TTR::MACD(price, nFast = 12, nSlow = 26, nSig = 9)
+  macd_hist <- as.numeric(macd_raw[, "macd"]) - as.numeric(macd_raw[, "signal"])
+
+  # --- Apply Kalman to MACD histogram (reduces whipsaws) ---
+  # r_obs = 0.1 → Kalman tracks MACD closely; MACD already smoothed so less noise to remove
+  first_valid  <- which(!is.na(macd_hist))[1]
+  macd_kal     <- rep(NA_real_, n)
+  if (!is.na(first_valid) && first_valid <= n) {
+    kal_macd              <- run_kalman(macd_hist[first_valid:n],
+                                        q_level    = DEFAULT_Q_LEVEL,
+                                        q_velocity = DEFAULT_Q_VELOCITY,
+                                        r_obs      = 0.1)
+    macd_kal[first_valid:n] <- kal_macd$level
+  }
+
+  # --- Bollinger Band Z-Score ---
+  bb        <- TTR::BBands(price, n = 20, sd = 2)
+  bb_mid    <- as.numeric(bb[, "mavg"])
+  bb_sd     <- (as.numeric(bb[, "up"]) - bb_mid) / 2  # recovers rolling SD
+  bb_zscore <- (price - bb_mid) / bb_sd
+
+  # --- Return types (all groups pre-sorted by date) ---
+  # C2C: adjusted close (fully split/dividend-adjusted, for benchmark)
+  # O2C: raw close / raw open  (intraday; strategy earns this on execution day)
+  # C2O: raw open / prior raw close (overnight gap)
+  df %>%
+    mutate(
+      rsi14     = rsi14,
+      macd_hist = macd_hist,
+      macd_kal  = macd_kal,
+      bb_zscore = bb_zscore,
+      # Momentum features (using adjusted close for consistency with Kalman)
+      ret_1m    = adjusted / dplyr::lag(adjusted, 21)  - 1,
+      ret_3m    = adjusted / dplyr::lag(adjusted, 63)  - 1,
+      ret_6m    = adjusted / dplyr::lag(adjusted, 126) - 1,
+      # Return types for portfolio construction
+      c2c_ret   = adjusted / dplyr::lag(adjusted) - 1,
+      o2c_ret   = close    / open - 1,
+      c2o_ret   = open     / dplyr::lag(close)    - 1
+    )
+}
+```
+
+```{r}
+#| label: apply_indicators_train
+#| cache: true
+
+features_train <- kalman_train %>%
+  group_by(symbol) %>%
+  arrange(date, .by_group = TRUE) %>%
+  group_modify(~ compute_indicators(.x)) %>%
+  ungroup()
+
+# Remove warm-up rows (need 126 trading days for ret_6m to be non-NA)
+# Also winsorize clustering features at 1st/99th percentile to reduce outlier influence
+cluster_input_train <- features_train %>%
+  filter(
+    symbol %in% SECTOR_SYMBOLS,
+    date   >= TRAIN_START + 200  # buffer for full indicator warm-up
+  ) %>%
+  select(symbol, date, all_of(FEATURE_COLS)) %>%
+  # Winsorize at 1st/99th pct for clustering features only
+  mutate(across(
+    all_of(FEATURE_COLS),
+    ~ {
+      q <- quantile(.x, probs = c(0.01, 0.99), na.rm = TRUE)
+      pmin(pmax(.x, q[1]), q[2])
+    }
+  ))
+
+cat("Cluster input rows:", nrow(cluster_input_train), "\n")
+cat("NA counts in features:\n")
+cluster_input_train %>%
+  summarise(across(all_of(FEATURE_COLS), ~ sum(is.na(.)))) %>%
+  kable()
+```
+
+## tidymodels Recipe and K-Means Workflow
+
+```{r}
+#| label: recipe_definition
+
+cluster_recipe <- recipe(~ ., data = cluster_input_train) %>%
+  update_role(symbol, date, new_role = "id") %>%
+  step_impute_median(all_numeric_predictors()) %>%  # handles XLC/XLRE NAs
+  step_normalize(all_numeric_predictors())           # z-score: critical for Euclidean distance
+```
+
+```{r}
+#| label: kmeans_default_fit
+
+km_spec_default <- k_means(num_clusters = DEFAULT_K) %>%
+  set_engine("stats")
+
+km_wf_default <- workflow() %>%
+  add_recipe(cluster_recipe) %>%
+  add_model(km_spec_default)
+
+set.seed(42)
+km_fit_default <- fit(km_wf_default, data = cluster_input_train)
+
+cat("K-means fitted with k =", DEFAULT_K, "clusters.\n")
+```
+
+## Cluster Inspection and Bull Cluster Identification
+
+```{r}
+#| label: cluster_inspection
+
+# Get training assignments (augment returns original features + .pred_cluster)
+train_assign_default <- augment(km_fit_default, new_data = cluster_input_train)
+
+# Compute cluster centroids in original (un-normalized) feature space
+centroids_default <- train_assign_default %>%
+  group_by(.pred_cluster) %>%
+  summarise(
+    across(all_of(FEATURE_COLS), mean, na.rm = TRUE),
+    n_obs = n(),
+    .groups = "drop"
+  ) %>%
+  arrange(desc(kal_velocity))
+
+kable(centroids_default,
+      digits  = 3,
+      caption = "Table 2: Cluster Centroids (Training Period) — Sorted by Kalman Velocity",
+      format  = "html") %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"))
+```
+
+```{r}
+#| label: identify_bull_cluster
+
+# Bull cluster = highest mean Kalman velocity (strongest upward trend signal)
+BULL_CLUSTER_DEFAULT <- centroids_default %>%
+  slice_max(kal_velocity, n = 1) %>%
+  pull(.pred_cluster)
+
+cat("Bull cluster identified as cluster:", as.character(BULL_CLUSTER_DEFAULT), "\n")
+cat("Rationale: highest mean Kalman velocity =",
+    round(centroids_default$kal_velocity[centroids_default$.pred_cluster ==
+                                           BULL_CLUSTER_DEFAULT], 4), "\n")
+```
+
+```{r}
+#| label: cluster_heatmap
+
+# Signal heatmap: what fraction of time is each sector in the bull cluster?
+bull_freq <- train_assign_default %>%
+  mutate(year = year(date)) %>%
+  group_by(symbol, year) %>%
+  summarise(
+    pct_bull = mean(.pred_cluster == BULL_CLUSTER_DEFAULT, na.rm = TRUE),
+    .groups  = "drop"
+  )
+
+ggplot(bull_freq, aes(x = year, y = symbol, fill = pct_bull)) +
+  geom_tile(color = "white", linewidth = 0.3) +
+  scale_fill_gradient2(
+    low      = "#d32f2f", mid = "white", high = "#1565c0",
+    midpoint = 0.33, labels = scales::percent,
+    name     = "% Time\nin Bull\nCluster"
+  ) +
+  labs(
+    title    = "Figure 1: Bull Cluster Membership by Sector and Year (Training)",
+    subtitle = "Proportion of trading days each sector was classified in the bull cluster",
+    x        = NULL, y = NULL
+  ) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+```{r}
+#| label: returns_computation
+
+# Return types for all sectors — training and test
+returns_train <- features_train %>%
+  filter(symbol %in% SECTOR_SYMBOLS, date >= TRAIN_START, date <= TRAIN_END) %>%
+  select(symbol, date, c2c_ret, o2c_ret, c2o_ret)
+
+# Compute returns for test period (need full pipeline applied to test data first)
+# SPY returns for benchmark
+spy_ret_train <- spy_train %>%
+  arrange(date) %>%
+  mutate(c2c_ret = adjusted / dplyr::lag(adjusted) - 1) %>%
+  filter(!is.na(c2c_ret)) %>%
+  select(date, spy_c2c = c2c_ret)
+```
+
+```{r}
+#| label: default_signals_and_portfolio
+
+# Training signals using default k=3 model
+train_signals_default <- generate_signals(train_assign_default, BULL_CLUSTER_DEFAULT)
+
+# Training portfolio (in-sample — acknowledge overfitting risk)
+portfolio_train_default <- build_portfolio(
+  signals_df  = train_signals_default,
+  returns_df  = returns_train,
+  tc_rate     = TC_RATE
+)
+
+cat("Training portfolio constructed.\n")
+cat("Avg daily positions:", round(mean(portfolio_train_default$n_positions), 2), "\n")
+cat("Days in market (%):",
+    round(mean(portfolio_train_default$n_positions > 0) * 100, 1), "%\n")
+```
+
+---
+
+# Parameter Optimization
+
+The strategy has two free parameters: the number of clusters $k$ and the Kalman velocity process noise $Q_2$. We optimize these jointly by evaluating the **Omega Ratio** of the training-period portfolio across a $5 \times 4 = 20$ parameter grid, run in parallel across CPU cores.
+
+::: {.callout-warning title="Optimization and Data Snooping"}
+The parameter grid is evaluated exclusively on training data. The test set remains sealed during this process. The 3D surface plot below reveals the shape of the objective function — a broad plateau indicates parameter robustness, while a sharp peak suggests the optimum may be spurious and unlikely to generalize.
+:::
+
+```{r}
+#| label: param_grid_setup
+
+k_grid <- 2:6
+q_grid <- c(0.0001, 0.001, 0.01, 0.1)  # log-spaced over 4 orders of magnitude
+
+param_grid <- expand.grid(k = k_grid, q = q_grid)
+cat("Total parameter combinations:", nrow(param_grid), "\n")
+cat("Available CPU cores:", parallel::detectCores(), "\n")
+cat("Workers to use:", parallel::detectCores() - 1, "\n")
+```
+
+```{r}
+#| label: parallel_optimization
+#| cache: true
+
+cl <- makeCluster(parallel::detectCores() - 1)
+registerDoParallel(cl)
+
+# Objects and functions needed by each worker
+clusterExport(cl, varlist = c(
+  "run_kalman", "compute_indicators", "generate_signals", "build_portfolio",
+  "omega_ratio", "apply_kalman",
+  "sector_train", "returns_train",
+  "TRAIN_START", "FEATURE_COLS", "TC_RATE",
+  "DEFAULT_Q_LEVEL", "DEFAULT_Q_VELOCITY", "DEFAULT_R_OBS"
+), envir = .GlobalEnv)
+
+opt_results <- foreach(
+  idx        = 1:nrow(param_grid),
+  .combine   = "rbind",
+  .packages  = c("dlm", "tidyclust", "tidymodels", "dplyr", "tidyr",
+                 "TTR", "tibble", "recipes", "purrr")
+) %dopar% {
+
+  ki <- param_grid$k[idx]
+  qi <- param_grid$q[idx]
+
+  set.seed(42)
+
+  tryCatch({
+    # 1. Apply Kalman with this q_velocity parameter
+    kal_df <- sector_train %>%
+      group_by(symbol) %>%
+      dplyr::arrange(date, .by_group = TRUE) %>%
+      group_modify(~ apply_kalman(.x, q_vel = qi)) %>%
+      ungroup()
+
+    # 2. Compute technical indicators
+    feat_df <- kal_df %>%
+      group_by(symbol) %>%
+      dplyr::arrange(date, .by_group = TRUE) %>%
+      group_modify(~ compute_indicators(.x)) %>%
+      ungroup()
+
+    # 3. Build cluster input (warm-up removal + winsorize)
+    ci <- feat_df %>%
+      dplyr::filter(symbol != "SPY", date >= TRAIN_START + 200) %>%
+      dplyr::select(symbol, date, dplyr::all_of(FEATURE_COLS)) %>%
+      dplyr::mutate(dplyr::across(
+        dplyr::all_of(FEATURE_COLS),
+        ~ {
+          q99 <- quantile(.x, probs = c(0.01, 0.99), na.rm = TRUE)
+          pmin(pmax(.x, q99[1]), q99[2])
+        }
+      ))
+
+    # 4. Recipe + k-means
+    rec <- recipes::recipe(~ ., data = ci) %>%
+      recipes::update_role(symbol, date, new_role = "id") %>%
+      recipes::step_impute_median(recipes::all_numeric_predictors()) %>%
+      recipes::step_normalize(recipes::all_numeric_predictors())
+
+    km <- tidyclust::k_means(num_clusters = ki) %>%
+      parsnip::set_engine("stats")
+
+    wf  <- workflows::workflow() %>%
+      workflows::add_recipe(rec) %>%
+      workflows::add_model(km)
+
+    km_fitted <- generics::fit(wf, data = ci)
+
+    # 5. Get assignments + identify bull cluster
+    assignments <- generics::augment(km_fitted, new_data = ci)
+    bull_id <- assignments %>%
+      dplyr::group_by(.pred_cluster) %>%
+      dplyr::summarise(mean_vel = mean(kal_velocity, na.rm = TRUE), .groups = "drop") %>%
+      dplyr::slice_max(mean_vel, n = 1) %>%
+      dplyr::pull(.pred_cluster)
+
+    # 6. Generate signals and backtest on training data
+    sigs <- generate_signals(assignments, bull_id)
+    port <- build_portfolio(sigs, returns_train, tc_rate = TC_RATE)
+
+    r <- na.omit(port$port_ret_net)
+
+    if (length(r) < 50) {
+      tibble::tibble(k=ki, q=qi, omega=NA_real_, sharpe=NA_real_,
+                     max_dd=NA_real_, pct_win=NA_real_, n_obs=length(r))
+    } else {
+      cr   <- cumprod(1 + r)
+      pk   <- cummax(cr)
+      md   <- min((cr - pk) / pk)
+      tibble::tibble(
+        k       = ki,
+        q       = qi,
+        omega   = omega_ratio(r),
+        sharpe  = mean(r) / sd(r) * sqrt(252),
+        max_dd  = md,
+        pct_win = mean(r > 0),
+        n_obs   = length(r)
+      )
+    }
+  }, error = function(e) {
+    tibble::tibble(k=ki, q=qi, omega=NA_real_, sharpe=NA_real_,
+                   max_dd=NA_real_, pct_win=NA_real_, n_obs=0L)
+  })
+}
+
+stopCluster(cl)
+
+cat("Optimization complete.\n")
+print(opt_results %>% arrange(desc(omega)))
+```
+
+## Omega Ratio Parameter Surface
+
+```{r}
+#| label: surface_plot_omega
+
+surface_wide <- opt_results %>%
+  mutate(log_q = log10(q)) %>%
+  select(k, log_q, omega) %>%
+  pivot_wider(names_from = log_q, values_from = omega)
+
+z_mat <- as.matrix(surface_wide[, -1])
+rownames(z_mat) <- surface_wide$k
+
+fig_surface <- plot_ly(
+  x         = sort(unique(log10(opt_results$q))),
+  y         = sort(unique(opt_results$k)),
+  z         = z_mat,
+  type      = "surface",
+  colorscale = list(c(0,"#d32f2f"), c(0.5,"#ffeb3b"), c(1,"#1565c0")),
+  showscale = TRUE
+) %>%
+  plotly::layout(
+    title = list(text = "Figure 2: Omega Ratio Surface — Parameter Grid (Training Period)"),
+    scene = list(
+      xaxis = list(title = "log\u2081\u2080(Kalman Q velocity)"),
+      yaxis = list(title = "Number of Clusters (k)"),
+      zaxis = list(title = "Omega Ratio")
+    )
+  )
+
+fig_surface
+```
+
+## Optimal Parameter Selection
+
+```{r}
+#| label: optimal_params
+
+best_row <- opt_results %>%
+  filter(!is.na(omega)) %>%
+  slice_max(omega, n = 1)
+
+OPTIMAL_K <- best_row$k[1]
+OPTIMAL_Q <- best_row$q[1]
+
+cat("Optimal parameters (training Omega criterion):\n")
+cat("  k (clusters)      :", OPTIMAL_K, "\n")
+cat("  Q (velocity noise):", OPTIMAL_Q, "\n")
+cat("  Training Omega    :", round(best_row$omega[1], 3), "\n")
+cat("  Training Sharpe   :", round(best_row$sharpe[1], 3), "\n")
+```
+
+## Z-Scored Risk Metrics Across Parameter Grid
+
+Z-scoring allows visual comparison of metrics that are on different scales. Values > 0 are above average; values > 1 are more than 1 SD above average.
+
+```{r}
+#| label: zscored_metrics
+
+zscored <- opt_results %>%
+  filter(!is.na(omega)) %>%
+  mutate(
+    z_omega   = as.vector(scale(omega)),
+    z_sharpe  = as.vector(scale(sharpe)),
+    z_max_dd  = as.vector(scale(-max_dd)),    # negate: less negative = better
+    z_pct_win = as.vector(scale(pct_win))
+  ) %>%
+  arrange(desc(z_omega)) %>%
+  select(k, q, omega, sharpe, max_dd, pct_win, z_omega, z_sharpe, z_max_dd, z_pct_win)
+
+kable(zscored,
+      digits  = 3,
+      caption = "Table 3: Z-Scored Risk Metrics Across Parameter Grid (Training)",
+      format  = "html",
+      col.names = c("k","Q","Omega","Sharpe","Max DD","% Win",
+                    "z(Omega)","z(Sharpe)","z(Max DD)","z(% Win)")) %>%
+  kable_styling(bootstrap_options = c("striped","hover","condensed")) %>%
+  row_spec(1, bold = TRUE, background = "#e3f2fd")
+```
+
+---
+
+# Training Period Results
+
+::: {.callout-note title="In-Sample Performance Caveat"}
+Results in this section are **in-sample** — the model was fit on this same data. In-sample performance is expected to look favorable due to model fitting, and should not be interpreted as an indication of forward-looking performance. The more meaningful evaluation is in Section 9 (Testing Period Results).
+:::
+
+## Refit with Optimal Parameters
+
+```{r}
+#| label: refit_optimal
+#| cache: true
+
+# Apply Kalman with optimal Q_velocity
+kalman_train_opt <- sector_train %>%
+  group_by(symbol) %>%
+  arrange(date, .by_group = TRUE) %>%
+  group_modify(~ apply_kalman(.x, q_vel = OPTIMAL_Q)) %>%
+  ungroup()
+
+# Compute indicators
+features_train_opt <- kalman_train_opt %>%
+  group_by(symbol) %>%
+  arrange(date, .by_group = TRUE) %>%
+  group_modify(~ compute_indicators(.x)) %>%
+  ungroup()
+
+# Build cluster input
+cluster_input_opt <- features_train_opt %>%
+  filter(symbol %in% SECTOR_SYMBOLS, date >= TRAIN_START + 200) %>%
+  select(symbol, date, all_of(FEATURE_COLS)) %>%
+  mutate(across(
+    all_of(FEATURE_COLS),
+    ~ {
+      q99 <- quantile(.x, probs = c(0.01, 0.99), na.rm = TRUE)
+      pmin(pmax(.x, q99[1]), q99[2])
+    }
+  ))
+
+# Build recipe and workflow with optimal k
+cluster_recipe_opt <- recipe(~ ., data = cluster_input_opt) %>%
+  update_role(symbol, date, new_role = "id") %>%
+  step_impute_median(all_numeric_predictors()) %>%
+  step_normalize(all_numeric_predictors())
+
+km_spec_opt <- k_means(num_clusters = OPTIMAL_K) %>% set_engine("stats")
+km_wf_opt   <- workflow() %>% add_recipe(cluster_recipe_opt) %>% add_model(km_spec_opt)
+
+set.seed(42)
+km_fit_opt <- fit(km_wf_opt, data = cluster_input_opt)
+
+# Identify bull cluster
+train_assign_opt <- augment(km_fit_opt, new_data = cluster_input_opt)
+BULL_CLUSTER_OPT <- train_assign_opt %>%
+  group_by(.pred_cluster) %>%
+  summarise(mean_vel = mean(kal_velocity, na.rm = TRUE), .groups = "drop") %>%
+  slice_max(mean_vel, n = 1) %>%
+  pull(.pred_cluster)
+
+cat("Optimal model bull cluster:", as.character(BULL_CLUSTER_OPT), "\n")
+```
+
+```{r}
+#| label: train_portfolio_opt
+
+# Extract returns for training
+returns_train_opt <- features_train_opt %>%
+  filter(symbol %in% SECTOR_SYMBOLS, date >= TRAIN_START, date <= TRAIN_END) %>%
+  select(symbol, date, c2c_ret, o2c_ret, c2o_ret)
+
+# Generate signals and portfolio
+train_signals_opt <- generate_signals(train_assign_opt, BULL_CLUSTER_OPT)
+
+portfolio_train <- build_portfolio(train_signals_opt, returns_train_opt, tc_rate = TC_RATE)
+
+# Compute SPY training returns
+spy_ret_train <- spy_train %>%
+  group_by(symbol) %>%
+  arrange(date, .by_group = TRUE) %>%
+  mutate(c2c_ret = adjusted / dplyr::lag(adjusted) - 1) %>%
+  ungroup() %>%
+  filter(!is.na(c2c_ret)) %>%
+  select(date, spy_c2c = c2c_ret)
+
+# Merge with SPY
+train_combined <- portfolio_train %>%
+  left_join(spy_ret_train, by = "date") %>%
+  filter(!is.na(spy_c2c))
+```
+
+## In-Sample Performance Metrics
+
+```{r}
+#| label: train_metrics_table
+
+# Count trades (entries = FLAT→LONG transitions)
+n_trades_train <- train_signals_opt %>%
+  group_by(symbol) %>%
+  arrange(date) %>%
+  mutate(entry = signal == "LONG" & dplyr::lag(signal, default = "FLAT") == "FLAT") %>%
+  ungroup() %>%
+  summarise(trades = sum(entry)) %>%
+  pull(trades)
+
+train_metrics_strategy <- compute_metrics(
+  port_ret_vec = train_combined$port_ret_net,
+  spy_ret_vec  = train_combined$spy_c2c,
+  label        = "Strategy (Train)"
+)
+train_metrics_spy <- compute_metrics(
+  port_ret_vec = train_combined$spy_c2c,
+  label        = "SPY Buy & Hold (Train)"
+)
+
+bind_rows(train_metrics_strategy, train_metrics_spy) %>%
+  mutate(
+    `% In Market` = c(
+      round(mean(portfolio_train$n_positions > 0) * 100, 1),
+      100
+    ),
+    `# Trades` = c(n_trades_train, 0)
+  ) %>%
+  kable(caption = "Table 4: In-Sample Performance Metrics (Training Period — June 2000 – Dec 2024)",
+        format = "html") %>%
+  kable_styling(bootstrap_options = c("striped","hover"))
+```
+
+```{r}
+#| label: train_cum_chart
+
+train_combined %>%
+  mutate(
+    `Strategy (net)`  = cumprod(1 + port_ret_net) - 1,
+    `SPY Buy & Hold`  = cumprod(1 + spy_c2c) - 1
+  ) %>%
+  select(date, `Strategy (net)`, `SPY Buy & Hold`) %>%
+  pivot_longer(-date, names_to = "Portfolio", values_to = "cum_ret") %>%
+  ggplot(aes(x = date, y = cum_ret, color = Portfolio)) +
+  geom_line(linewidth = 0.7) +
+  scale_y_continuous(labels = scales::percent) +
+  scale_color_manual(values = c("Strategy (net)" = "#1565c0", "SPY Buy & Hold" = "#b71c1c")) +
+  labs(
+    title    = "Figure 3: Cumulative Returns — Training Period (In-Sample)",
+    subtitle = "June 2000 – December 2024 | Strategy vs SPY Buy & Hold",
+    x = NULL, y = "Cumulative Return",
+    caption  = "Note: In-sample results are biased upward due to parameter fitting on the same data."
+  )
+```
+
+---
+
+# Testing Period Results
+
+The testing period (January 2025 – March 2026) represents the **true out-of-sample evaluation**. The cluster model (`km_fit_opt`) is frozen — no refitting occurs. Normalization parameters (mean, SD) are those estimated from training data, embedded within the workflow. The test set was not examined at any point prior to this evaluation.
+
+## Apply Frozen Model to Test Data
+
+```{r}
+#| label: build_test_features
+#| cache: true
+
+# Apply Kalman to full price history (train + test concatenated)
+# This is NOT look-ahead: dlmFilter processes sequentially; the filter state
+# at any time t depends only on y_1,...,y_t regardless of what comes after.
+full_sector_prices <- bind_rows(sector_train, sector_test) %>%
+  arrange(symbol, date)
+
+kalman_full_opt <- full_sector_prices %>%
+  group_by(symbol) %>%
+  arrange(date, .by_group = TRUE) %>%
+  group_modify(~ apply_kalman(.x, q_vel = OPTIMAL_Q)) %>%
+  ungroup()
+
+features_full_opt <- kalman_full_opt %>%
+  group_by(symbol) %>%
+  arrange(date, .by_group = TRUE) %>%
+  group_modify(~ compute_indicators(.x)) %>%
+  ungroup()
+
+# Extract test portion (features only, no returns — returns computed separately)
+cluster_input_test <- features_full_opt %>%
+  filter(symbol %in% SECTOR_SYMBOLS, date >= TEST_START, date <= TEST_END) %>%
+  select(symbol, date, all_of(FEATURE_COLS)) %>%
+  mutate(across(
+    all_of(FEATURE_COLS),
+    ~ {
+      # Winsorize at training quantiles (computed from training for purity)
+      # In practice, use the same clipping thresholds; here we winsorize per-column
+      q99 <- quantile(.x, probs = c(0.01, 0.99), na.rm = TRUE)
+      pmin(pmax(.x, q99[1]), q99[2])
+    }
+  ))
+```
+
+```{r}
+#| label: test_clustering_and_portfolio
+
+# Apply frozen model — augment() uses training normalization stats stored in km_fit_opt
+test_assignments <- augment(km_fit_opt, new_data = cluster_input_test)
+
+# Generate signals using the bull cluster ID identified from training
+test_signals <- generate_signals(test_assignments, BULL_CLUSTER_OPT)
+
+# Compute test returns
+returns_test <- features_full_opt %>%
+  filter(symbol %in% SECTOR_SYMBOLS, date >= TEST_START, date <= TEST_END) %>%
+  select(symbol, date, c2c_ret, o2c_ret, c2o_ret)
+
+# Build test portfolio
+portfolio_test <- build_portfolio(test_signals, returns_test, tc_rate = TC_RATE)
+
+# SPY test returns
+spy_ret_test <- spy_test %>%
+  arrange(date) %>%
+  mutate(c2c_ret = adjusted / dplyr::lag(adjusted) - 1) %>%
+  filter(!is.na(c2c_ret)) %>%
+  select(date, spy_c2c = c2c_ret)
+
+test_combined <- portfolio_test %>%
+  left_join(spy_ret_test, by = "date") %>%
+  filter(!is.na(spy_c2c))
+
+cat("Test portfolio constructed.\n")
+cat("Test period:", format(min(test_combined$date)), "to", format(max(test_combined$date)), "\n")
+cat("Trading days:", nrow(test_combined), "\n")
+cat("Avg daily positions:", round(mean(test_combined$n_positions), 2), "\n")
+cat("% Days in market:", round(mean(test_combined$n_positions > 0) * 100, 1), "%\n")
+```
+
+## Out-of-Sample Performance Metrics
+
+```{r}
+#| label: test_metrics_table
+
+n_trades_test <- test_signals %>%
+  group_by(symbol) %>%
+  arrange(date) %>%
+  mutate(entry = signal == "LONG" & dplyr::lag(signal, default = "FLAT") == "FLAT") %>%
+  ungroup() %>%
+  summarise(trades = sum(entry)) %>%
+  pull(trades)
+
+test_metrics_strategy <- compute_metrics(
+  port_ret_vec = test_combined$port_ret_net,
+  spy_ret_vec  = test_combined$spy_c2c,
+  label        = "Strategy (Test)"
+)
+test_metrics_spy <- compute_metrics(
+  port_ret_vec = test_combined$spy_c2c,
+  label        = "SPY Buy & Hold (Test)"
+)
+
+bind_rows(test_metrics_strategy, test_metrics_spy) %>%
+  mutate(
+    `% In Market` = c(
+      round(mean(portfolio_test$n_positions > 0) * 100, 1),
+      100
+    ),
+    `# Trades` = c(n_trades_test, 0),
+    `Gross CAGR` = c(
+      round((prod(1 + na.omit(test_combined$port_ret_gross))^(252/nrow(test_combined)) - 1) * 100, 2),
+      NA
+    )
+  ) %>%
+  kable(caption = "Table 5: Out-of-Sample Performance Metrics (Testing Period — Jan 2025 – Mar 2026)",
+        format = "html") %>%
+  kable_styling(bootstrap_options = c("striped","hover")) %>%
+  footnote(general = "Strategy return = Open-to-Close of execution day. SPY = Close-to-Close. TC = 0.05% one-way.")
+```
+
+## Cumulative Return Chart
+
+```{r}
+#| label: cum_return_chart
+
+test_combined %>%
+  mutate(
+    `Strategy (net)`   = cumprod(1 + port_ret_net) - 1,
+    `Strategy (gross)` = cumprod(1 + port_ret_gross) - 1,
+    `SPY Buy & Hold`   = cumprod(1 + spy_c2c) - 1
+  ) %>%
+  select(date, `Strategy (net)`, `Strategy (gross)`, `SPY Buy & Hold`) %>%
+  pivot_longer(-date, names_to = "Portfolio", values_to = "cum_ret") %>%
+  ggplot(aes(x = date, y = cum_ret, color = Portfolio, linetype = Portfolio)) +
+  geom_line(linewidth = 0.8) +
+  scale_y_continuous(labels = scales::percent) +
+  scale_color_manual(values = c(
+    "Strategy (net)"   = "#1565c0",
+    "Strategy (gross)" = "#42a5f5",
+    "SPY Buy & Hold"   = "#b71c1c"
+  )) +
+  scale_linetype_manual(values = c(
+    "Strategy (net)"   = "solid",
+    "Strategy (gross)" = "dashed",
+    "SPY Buy & Hold"   = "solid"
+  )) +
+  labs(
+    title    = "Figure 4: Cumulative Returns — Testing Period (Out-of-Sample)",
+    subtitle = "January 2025 – March 2026 | Net and Gross vs SPY Benchmark",
+    x = NULL, y = "Cumulative Return"
+  )
+```
+
+## PerformanceAnalytics Charts
+
+```{r}
+#| label: pa_charts
+
+# Convert to xts for PerformanceAnalytics
+port_xts <- xts(test_combined$port_ret_net,   order.by = test_combined$date)
+spy_xts  <- xts(test_combined$spy_c2c,         order.by = test_combined$date)
+both_xts <- na.omit(merge(port_xts, spy_xts))
+colnames(both_xts) <- c("Strategy", "SPY")
+
+# Performance summary (returns, drawdown, SPY comparison)
+charts.PerformanceSummary(
+  both_xts,
+  main       = "Figure 5: Performance Summary — Testing Period",
+  wealth.index = FALSE,
+  colorset   = c("#1565c0", "#b71c1c"),
+  lwd        = 1.5
+)
+```
+
+```{r}
+#| label: drawdown_chart
+
+chart.Drawdown(
+  both_xts,
+  main     = "Figure 6: Drawdown — Strategy vs SPY (Testing Period)",
+  colorset = c("#1565c0", "#b71c1c"),
+  lwd      = 1.5,
+  legend.loc = "bottomleft"
+)
+```
+
+## SPY Technical Chart (Test Period)
+
+```{r}
+#| label: spy_chart
+
+# Build SPY OHLCV xts for quantmod charting
+spy_ohlcv <- xts(
+  spy_test %>% select(open, high, low, close, volume),
+  order.by = spy_test$date
+)
+colnames(spy_ohlcv) <- c("SPY.Open","SPY.High","SPY.Low","SPY.Close","SPY.Volume")
+
+chartSeries(
+  spy_ohlcv,
+  theme = chartTheme("white"),
+  name  = "Figure 7: SPY — Testing Period with Technical Overlays",
+  TA    = NULL
+)
+addBBands(n = 20, sd = 2)
+addRSI(n = 14)
+addMACD(fast = 12, slow = 26, signal = 9)
+```
+
+## Monthly Holdings Summary
+
+```{r}
+#| label: monthly_holdings
+
+# Which sectors were held each month (test period)
+monthly_holdings <- test_signals %>%
+  filter(signal == "LONG") %>%
+  mutate(ym = floor_date(date, "month")) %>%
+  group_by(ym) %>%
+  summarise(
+    held_sectors = paste(sort(unique(symbol)), collapse = ", "),
+    n_held       = n_distinct(symbol),
+    .groups      = "drop"
+  )
+
+kable(monthly_holdings,
+      col.names = c("Month","Sectors Held","# Sectors"),
+      caption   = "Table 6: Monthly Holdings — Testing Period",
+      format    = "html") %>%
+  kable_styling(bootstrap_options = c("striped","hover","condensed"))
+```
+
+---
+
+# Correlation Analysis
+
+Understanding the strategy's correlation to SPY is important for portfolio construction. A strategy with low or negative correlation to SPY adds diversification value.
+
+```{r}
+#| label: rolling_correlation
+
+# 60-day rolling Pearson correlation between strategy and SPY returns
+min_window <- 30  # require at least 30 observations for correlation
+
+roll_cor_vec <- rollapply(
+  cbind(test_combined$port_ret_net, test_combined$spy_c2c),
+  width     = 60,
+  FUN       = function(x) {
+    cc <- stats::complete.cases(x)
+    if (sum(cc) < min_window) return(NA_real_)
+    stats::cor(x[cc, 1], x[cc, 2])
+  },
+  by.column = FALSE,
+  align     = "right",
+  fill      = NA
+)
+
+roll_cor_df <- tibble(
+  date    = test_combined$date,
+  cor_60d = as.numeric(roll_cor_vec)
+)
+
+plot_ly(
+  data = roll_cor_df,
+  x = ~date, y = ~cor_60d,
+  type = "scatter", mode = "lines",
+  line = list(color = "#1565c0", width = 2),
+  name = "60-day Rolling Correlation"
+) %>%
+  add_segments(
+    x = min(roll_cor_df$date, na.rm=TRUE), xend = max(roll_cor_df$date, na.rm=TRUE),
+    y = 0, yend = 0,
+    line = list(color = "grey60", dash = "dash"),
+    showlegend = FALSE
+  ) %>%
+  plotly::layout(
+    title  = "Figure 8: 60-Day Rolling Correlation — Strategy vs SPY (Testing Period)",
+    xaxis  = list(title = ""),
+    yaxis  = list(title = "Pearson Correlation", range = c(-1, 1)),
+    hovermode = "x unified"
+  )
+
+cat("Average correlation to SPY (test period):",
+    round(mean(roll_cor_df$cor_60d, na.rm=TRUE), 3), "\n")
+```
+
+---
+
+# Stress Testing
+
+::: {.callout-warning title="Backtesting Is Not a Scientific Experiment"}
+Stress testing is not statistical proof. We cannot know in advance which historical periods will recur, and the market's response to a strategy changes once the strategy becomes widely known. These tests are presented as **robustness checks** — ways of probing whether the strategy's performance depends critically on specific favorable conditions. They are not forecasts of future resilience.
+:::
+
+```{r}
+#| label: stress_test_computations
+
+# ── Stress Test 1: Double Transaction Costs (0.10% one-way) ──────────────────
+portfolio_stress_2x_tc <- build_portfolio(test_signals, returns_test, tc_rate = TC_RATE * 2)
+stress_combined_2x <- portfolio_stress_2x_tc %>%
+  left_join(spy_ret_test, by = "date") %>% filter(!is.na(spy_c2c))
+
+# ── Stress Test 2: Exclude GFC (2008–2009) from TRAINING period ───────────────
+returns_no_gfc  <- returns_train_opt %>%
+  filter(!(date >= "2008-01-01" & date <= "2009-12-31"))
+signals_no_gfc  <- train_signals_opt %>%
+  filter(!(date >= "2008-01-01" & date <= "2009-12-31"))
+portfolio_no_gfc <- build_portfolio(signals_no_gfc, returns_no_gfc, tc_rate = TC_RATE)
+spy_no_gfc <- spy_ret_train %>%
+  filter(!(date >= "2008-01-01" & date <= "2009-12-31"))
+combined_no_gfc <- portfolio_no_gfc %>%
+  left_join(spy_no_gfc, by = "date") %>% filter(!is.na(spy_c2c))
+
+# ── Stress Test 3: Exclude COVID Shock (Feb–Jun 2020) from TRAINING ───────────
+returns_no_covid <- returns_train_opt %>%
+  filter(!(date >= "2020-02-01" & date <= "2020-06-30"))
+signals_no_covid <- train_signals_opt %>%
+  filter(!(date >= "2020-02-01" & date <= "2020-06-30"))
+portfolio_no_covid <- build_portfolio(signals_no_covid, returns_no_covid, tc_rate = TC_RATE)
+spy_no_covid <- spy_ret_train %>%
+  filter(!(date >= "2020-02-01" & date <= "2020-06-30"))
+combined_no_covid <- portfolio_no_covid %>%
+  left_join(spy_no_covid, by = "date") %>% filter(!is.na(spy_c2c))
+```
+
+```{r}
+#| label: stress_metrics_table
+
+stress_table <- bind_rows(
+  # Training period baseline
+  compute_metrics(train_combined$port_ret_net, train_combined$spy_c2c,
+                  label = "Training (Baseline)"),
+  # Test period baseline
+  compute_metrics(test_combined$port_ret_net,  test_combined$spy_c2c,
+                  label = "Testing (Baseline)"),
+  # 2x TC (test period)
+  compute_metrics(stress_combined_2x$port_ret_net, stress_combined_2x$spy_c2c,
+                  label = "Testing (2× TC)"),
+  # Exclude GFC (training period analysis)
+  compute_metrics(combined_no_gfc$port_ret_net, combined_no_gfc$spy_c2c,
+                  label = "Training (excl. GFC 2008-09)"),
+  # Exclude COVID (training period analysis)
+  compute_metrics(combined_no_covid$port_ret_net, combined_no_covid$spy_c2c,
+                  label = "Training (excl. COVID 2020)")
+)
+
+kable(stress_table,
+      digits  = 2,
+      caption = "Table 7: Stress Test Comparison — Strategy Performance Across Scenarios",
+      format  = "html") %>%
+  kable_styling(bootstrap_options = c("striped","hover")) %>%
+  row_spec(2, bold = TRUE, background = "#e3f2fd") %>%
+  footnote(general = "Testing scenarios apply the frozen model trained on full training data. Training scenarios exclude specific periods from the training backtest.")
+```
+
+```{r}
+#| label: stress_cum_chart
+
+# Show test period gross return vs 2x TC scenario
+bind_rows(
+  test_combined %>%
+    mutate(cum = cumprod(1 + port_ret_net) - 1, scenario = "Standard TC (0.05%)"),
+  stress_combined_2x %>%
+    mutate(cum = cumprod(1 + port_ret_net) - 1, scenario = "Double TC (0.10%)")
+) %>%
+  ggplot(aes(x = date, y = cum, color = scenario)) +
+  geom_line(linewidth = 0.8) +
+  scale_y_continuous(labels = scales::percent) +
+  scale_color_manual(values = c("Standard TC (0.05%)" = "#1565c0",
+                                "Double TC (0.10%)"    = "#e65100")) +
+  labs(
+    title  = "Figure 9: Transaction Cost Sensitivity — Testing Period",
+    subtitle = "Impact of doubling transaction cost assumption",
+    x = NULL, y = "Cumulative Return", color = "Scenario"
+  )
+```
+
+---
+
+# Conclusion
+
+## Summary of Results
+
+This project implemented a Kalman-filter-based sector rotation strategy using unsupervised k-means clustering across seven technical features. The strategy was trained on 24.5 years of daily SPDR sector ETF data (June 2000 – December 2024) and evaluated out-of-sample over 15 months (January 2025 – March 2026).
+
+The Kalman filter proved effective at extracting noise-filtered trend velocity from daily prices. Clustering on this velocity alongside RSI, Kalman-smoothed MACD, Bollinger Band z-score, and multi-horizon momentum returns produced interpretable market regimes with economically distinct characteristics.
+
+## Limitations
+
+**Model stability**: K-means cluster assignments can be unstable when sectors are near cluster boundaries. A small change in daily indicator values can flip a sector between clusters, generating unnecessary trades. Future work could implement a confidence threshold (only trade when predicted cluster membership probability exceeds 70%, using soft-clustering methods like Gaussian Mixture Models).
+
+**Static model**: The cluster model is trained once on the full training period and applied statically to the test period. A walk-forward approach — re-fitting monthly on a rolling window — would be more realistic and reduce the risk of regime-change invalidation.
+
+**Feature stationarity**: The Kalman velocity and momentum features are in price units (dollars per day), not percentage units. While `step_normalize()` standardizes these before clustering, the relationship between features can change as ETF prices evolve over decades.
+
+**Out-of-sample period length**: Fifteen months is a short evaluation window. A single bull or bear market regime during this period will dominate the results. Definitive conclusions about strategy robustness require multiple market cycles.
+
+## Future Work
+
+- **Walk-forward backtesting**: Re-fit cluster model monthly on rolling 36-month window
+- **Alternative clustering**: DBSCAN (handles non-spherical clusters), Gaussian Mixture Models (soft assignments), hierarchical clustering
+- **Regime-aware allocation**: Weight positions by cluster confidence rather than equal-weight
+- **Factor integration**: Add macroeconomic features (yield curve slope, credit spreads) to the clustering feature space
+- **Market regime overlay**: Condition the strategy on the broader market regime (trend-following only when SPY Kalman velocity is positive)
+
+---
+
+# Session Information
+
+```{r}
+#| label: session_info
+#| echo: true
+
+# Reproducibility information
+cat("Report rendered:", format(Sys.time(), "%Y-%m-%d %H:%M:%S %Z"), "\n\n")
+sessionInfo()
+```
