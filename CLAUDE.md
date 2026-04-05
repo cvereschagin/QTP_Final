@@ -84,7 +84,7 @@ helper_functions               → run_kalman(), omega_ratio(), generate_signals
                                   build_portfolio(), compute_metrics()
 apply_kalman_train             → kalman_train, returns_train, spy_ret_train [cache: TRUE]
 default_ranking_inspection     → train_signals_default → Figure 1 (heatmap)
-param_grid_setup               → param_grid (16 combos: k=2:5 × Q=4 values)
+param_grid_setup               → param_grid (32 combos: k=2:5 × Q=8 log-spaced values)
 parallel_optimization          → opt_results [cache: TRUE — slow]
 surface_plot_omega             → Figure 2 (plotly 3D surface)
 optimal_params                 → OPTIMAL_K, OPTIMAL_Q
