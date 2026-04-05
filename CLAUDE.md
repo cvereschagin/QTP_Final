@@ -2,7 +2,7 @@
 
 ## Project Overview
 
-Single-file Quarto project implementing a **Kalman Filter + K-Means Sector Rotation** strategy across S&P 500 Select Sector SPDRs. All analysis lives in one file:
+Single-file Quarto project implementing a **Kalman Filter + K-Means Clustering + Yield Curve Sector Rotation** strategy across S&P 500 Select Sector SPDRs. All analysis lives in one file:
 
 **`momentum_sector_rotation.qmd`** → renders to self-contained `momentum_sector_rotation.html`
 
@@ -32,19 +32,19 @@ quarto render momentum_sector_rotation.qmd
 |---|---|
 | Training | June 2000 – December 2024 |
 | Testing | January 2025 – March 2026 |
-| Download buffer | TRAIN_START − 200 days (indicator warm-up) |
+| Download buffer | TRAIN_START − 30 days |
 
 ---
 
 ## Strategy Summary
 
-1. **Kalman Filter** (`dlmFilter`, NOT `dlmSmooth`) applied to each sector's daily adjusted close → extracts `kal_level` and `kal_velocity` (trend direction signal)
-2. **Technical indicators** computed via TTR: RSI-14, MACD histogram (Kalman-smoothed → `macd_kal`), Bollinger Band z-score, 1m/3m/6m momentum returns
-3. **K-means clustering** via `tidyclust` on 7 normalized features — cluster with highest mean `kal_velocity` = "Bull cluster"
-4. **Signal**: sectors in Bull cluster → LONG (equal weight); others → FLAT
-5. **Execution**: signal at Close_T → execute at Open_{T+1} → earn Open-to-Close return of T+1
+1. **Kalman Filter** (`dlmFilter`, NOT `dlmSmooth`) applied to each sector's daily adjusted close → extracts `kal_level` and `kal_velocity` (noise-filtered trend slope)
+2. **K-Means Clustering** (base R `kmeans()`) on `kal_velocity` only (single feature, `k` clusters) at each month-end — cluster with highest mean `kal_velocity` = "Bull cluster"
+3. **Yield Curve Overlay** (FRED `T10Y2Y`): if 10Y-2Y spread < -0.25%, override cluster signal → LONG XLP, XLU, XLV (defensives) only
+4. **Signal**: sectors in Bull cluster (or defensives if yield curve inverted) → LONG equal weight; others → FLAT
+5. **Execution**: signal at month-end Close_T → execute at Open_{T+1} → earn Open-to-Close return; hold until next month-end
 6. **Transaction cost**: 0.05% one-way per unit of weight change
-7. **Long-only**: no short positions
+7. **Long-only, monthly rebalancing**: no short positions; ~12 rebalances/year
 
 ---
 
@@ -52,10 +52,10 @@ quarto render momentum_sector_rotation.qmd
 
 ### Look-Ahead Bias Safeguards
 - Use `dlmFilter()` only, never `dlmSmooth()`
-- `step_normalize()` fits on training data only (embedded in workflow; applied to test via `augment()`)
-- Rolling returns use `dplyr::lag()` (backward-looking)
+- Yield curve forward-filled with `zoo::na.locf()` using only past observations
+- All return calculations use `dplyr::lag()` (backward-looking)
+- Parameter optimization (`k` and `Q`) on training data exclusively
 - Test set untouched until Section 9
-- Parameter optimization on training data exclusively
 
 ### Return Types
 | Type | Formula | Use |
@@ -76,42 +76,36 @@ quarto render momentum_sector_rotation.qmd
 Chunks must run in this strict sequence (Quarto executes top-to-bottom):
 
 ```
-setup                     → constants, packages, tidymodels_prefer()
-data_download             → raw_prices via tq_get() [cache: TRUE]
-data_quality              → coverage table
-data_split                → sector_train/test, spy_train/test [FIREWALL]
-helper_functions          → run_kalman(), omega_ratio(), generate_signals(), build_portfolio(), compute_metrics()
-compute_indicators_fn     → compute_indicators()
-apply_kalman_train        → kalman_train [cache: TRUE]
-apply_indicators_train    → features_train, cluster_input_train [cache: TRUE]
-recipe_definition         → cluster_recipe
-kmeans_default_fit        → km_fit_default (k=3)
-cluster_inspection        → centroids, BULL_CLUSTER_DEFAULT
-identify_bull_cluster     → BULL_CLUSTER_DEFAULT
-cluster_heatmap           → Figure 1
-returns_computation       → returns_train, spy_ret_train
-default_signals_and_portfolio → portfolio_train_default
-param_grid_setup          → param_grid (20 combos)
-parallel_optimization     → opt_results [cache: TRUE — slow]
-surface_plot_omega        → Figure 2 (plotly 3D)
-optimal_params            → OPTIMAL_K, OPTIMAL_Q
-zscored_metrics           → Table 3
-refit_optimal             → km_fit_opt, BULL_CLUSTER_OPT [cache: TRUE]
-train_portfolio_opt       → portfolio_train, returns_train_opt, spy_ret_train, train_combined
-train_metrics_table       → Table 4
-train_cum_chart           → Figure 3
-build_test_features       → cluster_input_test [cache: TRUE]
-test_clustering_and_portfolio → test_assignments, test_signals, portfolio_test, test_combined
-test_metrics_table        → Table 5
-cum_return_chart          → Figure 4
-pa_charts                 → Figure 5 (charts.PerformanceSummary)
-drawdown_chart            → Figure 6 (chart.Drawdown)
-spy_chart                 → Figure 7 (chartSeries + overlays)
-monthly_holdings          → Table 6
-rolling_correlation       → Figure 8 (plotly)
-stress_test_computations  → 3 stress scenarios
-stress_metrics_table      → Table 7
-stress_cum_chart          → Figure 9
+setup                          → constants, packages
+data_download                  → raw_prices via tq_get(); yc_raw via FRED [cache: TRUE]
+data_quality                   → coverage table (Table 1)
+data_split                     → sector_train/test, spy_train/test, yc_filled [FIREWALL]
+helper_functions               → run_kalman(), omega_ratio(), generate_signals_clustered(),
+                                  build_portfolio(), compute_metrics()
+apply_kalman_train             → kalman_train, returns_train, spy_ret_train [cache: TRUE]
+default_ranking_inspection     → train_signals_default → Figure 1 (heatmap)
+param_grid_setup               → param_grid (16 combos: k=2:5 × Q=4 values)
+parallel_optimization          → opt_results [cache: TRUE — slow]
+surface_plot_omega             → Figure 2 (plotly 3D surface)
+optimal_params                 → OPTIMAL_K, OPTIMAL_Q
+zscored_metrics                → Table 3
+refit_optimal                  → kalman_train_opt, train_signals_opt, portfolio_train,
+                                  train_combined [cache: TRUE]
+train_metrics_table            → Table 4
+velocity_animation             → Figure 2 (animated bar chart, Bull cluster highlighted)
+train_cum_chart                → Figure 3
+build_test_features            → kalman_full_opt [cache: TRUE]
+test_clustering_and_portfolio  → test_signals, portfolio_test, test_combined
+test_metrics_table             → Table 5
+cum_return_chart               → Figure 4 (gross vs net vs SPY)
+pa_charts                      → Figure 5 (charts.PerformanceSummary)
+drawdown_chart                 → Figure 6 (chart.Drawdown)
+spy_chart                      → Figure 7 (chartSeries + overlays)
+monthly_holdings               → Table 6
+rolling_correlation            → Figure 8 (plotly)
+stress_test_computations       → 3 stress scenarios
+stress_metrics_table           → Table 7
+stress_cum_chart               → Figure 9
 session_info
 ```
 
@@ -122,11 +116,14 @@ session_info
 | Object | Type | Description |
 |---|---|---|
 | `SYMBOLS` / `SECTOR_SYMBOLS` | character vec | All 12 / just 11 sectors |
-| `FEATURE_COLS` | character vec | 7 clustering features |
+| `DEFAULT_K` / `K_GRID` | scalar / int vec | Default k=3; grid search 2:5 |
+| `YC_THRESHOLD` | scalar | -0.0025 (−0.25%) inversion trigger |
+| `DEFENSIVE_SECTORS` | character vec | c("XLP","XLU","XLV") |
 | `OPTIMAL_K` / `OPTIMAL_Q` | scalar | Best params from grid search |
-| `BULL_CLUSTER_OPT` | factor level | Cluster ID for LONG signal |
-| `km_fit_opt` | workflow | Frozen trained model (apply to test) |
-| `portfolio_train` / `portfolio_test` | tibble | Daily net returns + n_positions |
+| `yc_filled` | tibble | FRED T10Y2Y, forward-filled to all dates |
+| `kalman_train_opt` / `kalman_full_opt` | tibble | Kalman output with OPTIMAL_Q |
+| `train_signals_opt` / `test_signals` | tibble | cols: symbol, date, signal, cluster, kal_velocity, yield_spread, yc_inverted |
+| `portfolio_train` / `portfolio_test` | tibble | Daily port_ret_gross, port_ret_net, n_positions |
 | `train_combined` / `test_combined` | tibble | Strategy + SPY returns merged |
 
 ---
@@ -136,17 +133,19 @@ session_info
 ```r
 # Install if missing:
 install.packages(c(
-  "tidyquant", "TTR", "xts", "quantmod", "PerformanceAnalytics",
-  "dlm", "tidymodels", "tidyclust",
+  "tidyquant", "xts", "PerformanceAnalytics",
+  "dlm",
   "doParallel", "foreach",
-  "plotly", "ggplot2", "patchwork", "scales",
+  "plotly", "ggplot2", "scales",
   "dplyr", "tidyr", "purrr", "lubridate", "tibble", "zoo",
   "knitr", "kableExtra"
 ))
 ```
 
+**Removed from original**: `TTR`, `tidymodels`, `tidyclust`, `quantmod`, `patchwork`
+(k-means now uses base R `kmeans()`; no recipe/workflow infrastructure needed)
+
 Minimum versions:
-- `tidyclust` >= 0.1.2 (k_means() and augment() API)
 - Quarto >= 1.3 (native Mermaid rendering)
 
 ---
@@ -156,12 +155,12 @@ Minimum versions:
 Nine explicit `callout-warning` boxes in Section 5.7:
 1. Survivorship bias
 2. Look-ahead bias
-3. Data mining / parameter snooping
+3. Data mining / parameter snooping (2 params: `k` and `Q`; 16 combos)
 4. Storytelling / narrative fitting
 5. Transaction costs
 6. Adjusted price look-ahead
 7. Short selling constraints
-8. Outliers (winsorized at 1st/99th pct for clustering features)
+8. Outliers (Kalman filter absorbs outliers before clustering; no winsorization)
 9. Backtests ≠ scientific experiments
 
 ---
@@ -169,12 +168,11 @@ Nine explicit `callout-warning` boxes in Section 5.7:
 ## Caching Notes
 
 Add `#| cache: true` to slow chunks for faster re-renders:
-- `data_download` — Yahoo Finance API calls
-- `apply_kalman_train` — Kalman on 11 × 6,500 days
-- `apply_indicators_train` — TTR indicators
-- `parallel_optimization` — 20-combination parallel grid
+- `data_download` — Yahoo Finance + FRED API calls
+- `apply_kalman_train` — Kalman on 11 × ~6,500 days
+- `parallel_optimization` — 16-combination parallel grid
 - `refit_optimal` — full pipeline with optimal params
-- `build_test_features` — Kalman + indicators on full history
+- `build_test_features` — Kalman on full train+test history
 
 Clear cache with: `quarto render momentum_sector_rotation.qmd --cache-refresh`
 
@@ -184,10 +182,10 @@ Clear cache with: `quarto render momentum_sector_rotation.qmd --cache-refresh`
 
 Before submission, verify:
 - [ ] `quarto render momentum_sector_rotation.qmd` completes without errors
-- [ ] Both Mermaid diagrams render in browser (Section 3 and Section 5.3)
-- [ ] 3D Omega surface is interactive (Section 7)
+- [ ] Both Mermaid diagrams render in browser (Section 3 and Section 5.4)
+- [ ] 3D Omega surface is interactive (Section 7) — axes: k (clusters) × log10(Q)
+- [ ] Velocity animation renders with "Bull Cluster (LONG)" legend (Section 8)
 - [ ] `charts.PerformanceSummary()` renders (Section 9)
-- [ ] `chartSeries()` with overlays renders (Section 9)
 - [ ] HTML opens offline (confirms `embed-resources: true` works)
-- [ ] Training and Testing metrics tables both present
+- [ ] Training and Testing metrics tables both present (Tables 4 and 5)
 - [ ] Gross vs net returns shown in Figure 4
