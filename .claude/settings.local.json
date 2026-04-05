@@ -1,7 +1,8 @@
 {
   "permissions": {
     "allow": [
-      "Bash(git -C /c/users/cvere/documents/FIN452/QTP_Final log --oneline -10)"
+      "Bash(git -C /c/users/cvere/documents/FIN452/QTP_Final log --oneline -10)",
+      "WebSearch"
     ]
   }
 }
