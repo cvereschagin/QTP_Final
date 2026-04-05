@@ -82,6 +82,21 @@ YC_THRESHOLD      <- -0.0025                   # 10Y-2Y < -0.25% → go to cash 
 # Known ETF launch dates (important for data coverage disclosure)
 XLC_LAUNCH  <- as.Date("2018-06-18")
 XLRE_LAUNCH <- as.Date("2015-10-07")
+
+# Sector name labels for charts — ticker (Full Name)
+SECTOR_NAMES <- c(
+  XLB  = "XLB (Materials)",
+  XLC  = "XLC (Comm. Services)",
+  XLE  = "XLE (Energy)",
+  XLF  = "XLF (Financials)",
+  XLI  = "XLI (Industrials)",
+  XLK  = "XLK (Technology)",
+  XLP  = "XLP (Consumer Staples)",
+  XLRE = "XLRE (Real Estate)",
+  XLV  = "XLV (Health Care)",
+  XLU  = "XLU (Utilities)",
+  XLY  = "XLY (Cons. Discretionary)"
+)
 ```
 
 ---
@@ -449,7 +464,7 @@ rank_freq <- train_signals_default %>%
 hm_wide <- rank_freq %>%
   pivot_wider(names_from = year, values_from = pct_selected, values_fill = 0)
 hm_mat  <- as.matrix(hm_wide[, -1])
-rownames(hm_mat) <- hm_wide$symbol
+rownames(hm_mat) <- SECTOR_NAMES[hm_wide$symbol]
 
 plot_ly(
   x          = colnames(hm_mat),
@@ -475,14 +490,14 @@ The complete daily decision process is summarized in the diagram below.
 ```{mermaid}
 %%{init: {'theme': 'base', 'themeVariables': {'primaryColor': '#e3f2fd', 'primaryTextColor': '#0d1b2a', 'primaryBorderColor': '#1565c0', 'lineColor': '#1565c0', 'secondaryColor': '#fff3e0', 'tertiaryColor': '#ffffff'}}}%%
 flowchart TD
-    A([Daily Close]):::start --> B[Apply Kalman Filter\ndlmFilter — forward pass only]
-    B --> C[Extract kal_velocity\nnoise-filtered trend slope]
-    C --> D{Yield curve inverted?\n10Y-2Y < -0.25%}
-    D -- Yes --> E[ALL FLAT\nGo to cash]:::exit
-    D -- No --> F[K-Means Clustering\nk clusters on kal_velocity]
-    F --> G[Identify Bull Cluster\nhighest mean velocity]:::bull
-    G --> H[LONG sectors in Bull Cluster\nequal weight]:::bull
-    E --> I[Apply TC: 0.05%\nper unit weight change]
+    A([Daily Close]):::start --> B["Apply Kalman Filter<br/>dlmFilter — forward pass only"]
+    B --> C["Extract kal_velocity<br/>noise-filtered trend slope"]
+    C --> D{"Yield curve inverted?<br/>10Y-2Y < -0.25%"}
+    D -- Yes --> E["ALL FLAT<br/>Go to cash"]:::exit
+    D -- No --> F["K-Means Clustering<br/>k clusters on kal_velocity"]
+    F --> G["Identify Bull Cluster<br/>highest mean velocity"]:::bull
+    G --> H["LONG sectors in Bull Cluster<br/>equal weight"]:::bull
+    E --> I["Apply TC: 0.05%<br/>per unit weight change"]
     H --> I
     I --> J([Execute at Open T+1]):::start
     J --> A
@@ -511,7 +526,7 @@ Transaction costs are 0.05% one-way ($|\Delta w_i| \times 0.0005$), covering est
 
 ## Training Period
 
-The strategy has two free parameters — $k$ (number of clusters) and $Q_2$ (Kalman velocity noise) — optimized jointly on training data by evaluating the Omega ratio across a 5 × 12 = 60 combination grid. $k$ ranges from 2 to 6; $Q_2$ is evaluated at 12 log-spaced values spanning five orders of magnitude from 0.00001 to 0.1. This fine grid captures subtle differences in filter responsiveness across the full spectrum from very slow (long-memory) to very fast (reactive). The grid runs in parallel across available CPU cores.
+The strategy has two free parameters — $k$ (number of clusters) and $Q_2$ (Kalman velocity noise) — optimized jointly on training data by evaluating the Omega ratio across a 5 × 12 = 60 combination grid. $k$ ranges from 2 to 6; $Q_2$ is evaluated at 12 log-spaced values from $1 \times 10^{-5}$ to $1 \times 10^{-1}$ (0.00001 to 0.1). Because these values span five orders of magnitude, the optimization surface is plotted on a log₁₀ scale — so the x-axis runs from −5 to −1, where each tick represents a tenfold change in $Q_2$. The grid runs in parallel across available CPU cores.
 
 I optimize for Omega ratio rather than cumulative return because cumulative return would simply reward parameters that kept the portfolio most invested during the 2009–2021 bull market, penalizing the yield curve cash periods that are the strategy's core risk management mechanism. Omega ratio measures whether the strategy generates more dollar-weighted upside than downside at zero return, accounting for all moments of the distribution rather than just mean and variance as Sharpe does.
 
@@ -638,13 +653,14 @@ OPTIMAL_K <- best_row$k[1]
 OPTIMAL_Q <- best_row$q[1]
 
 cat("Optimal parameters (training Omega criterion):\n")
-cat("  k (clusters)      :", OPTIMAL_K, "\n")
-cat("  Q (velocity noise):", OPTIMAL_Q, "\n")
-cat("  Training Omega    :", round(best_row$omega[1], 3), "\n")
-cat("  Training Sharpe   :", round(best_row$sharpe[1], 3), "\n")
+cat("  k (clusters)         :", OPTIMAL_K, "\n")
+cat("  Q2 (velocity noise)  :", formatC(OPTIMAL_Q, format = "e", digits = 1),
+    sprintf("  [log10 = %.1f]", log10(OPTIMAL_Q)), "\n")
+cat("  Training Omega       :", round(best_row$omega[1], 3), "\n")
+cat("  Training Sharpe      :", round(best_row$sharpe[1], 3), "\n")
 ```
 
-The optimizer selects $k$ = `r OPTIMAL_K` clusters and $Q_2$ = `r OPTIMAL_Q`. These parameters are frozen and applied without adjustment to the test period.
+The optimizer selects $k$ = `r OPTIMAL_K` clusters and $Q_2$ = `r formatC(OPTIMAL_Q, format = "e", digits = 1)` (log₁₀ = `r round(log10(OPTIMAL_Q), 1)`). These parameters are frozen and applied without adjustment to the test period.
 
 ```{r}
 #| label: refit_optimal
@@ -925,11 +941,12 @@ plot_ly(dd_df2, x = ~date) %>%
 # Tile chart: each row = one sector, each column = one day, blue = LONG
 pos_tile <- test_signals %>%
   mutate(
-    held   = signal == "LONG",
-    symbol = factor(symbol, levels = rev(sort(unique(symbol))))
+    held        = signal == "LONG",
+    sector_name = SECTOR_NAMES[symbol],
+    sector_name = factor(sector_name, levels = rev(sort(unique(sector_name))))
   )
 
-p_tile <- ggplot(pos_tile, aes(x = date, y = symbol, fill = held)) +
+p_tile <- ggplot(pos_tile, aes(x = date, y = sector_name, fill = held)) +
   geom_tile(width = 1, height = 0.85) +
   scale_fill_manual(
     values = c("TRUE" = "#1565c0", "FALSE" = "#eeeeee"),
@@ -947,62 +964,8 @@ p_tile <- ggplot(pos_tile, aes(x = date, y = symbol, fill = held)) +
     plot.title       = element_text(size = 12)
   )
 
-ggplotly(p_tile, tooltip = c("x", "y", "fill")) %>%
+ggplotly(p_tile, tooltip = c("x", "sector_name", "fill")) %>%
   layout(legend = list(orientation = "h", x = 0, y = 1.1))
-```
-
-```{r}
-#| label: daily_pnl_chart
-
-pnl_df <- test_combined %>%
-  mutate(
-    daily_pct = port_ret_net * 100,
-    cum_pct   = (cumprod(1 + port_ret_net) - 1) * 100,
-    bar_color = if_else(daily_pct >= 0, "gain", "loss")
-  )
-
-# Figure 7a: Daily P&L bars
-plot_ly(pnl_df, x = ~date) %>%
-  add_bars(
-    y             = ~daily_pct,
-    color         = ~bar_color,
-    colors        = c("gain" = "#1b5e20", "loss" = "#b71c1c"),
-    showlegend    = FALSE,
-    hovertemplate = "%{x}<br>Daily: %{y:.2f}%<extra></extra>"
-  ) %>%
-  plotly::layout(
-    title     = "Figure 7a: Daily P&L — Testing Period",
-    xaxis     = list(title = ""),
-    yaxis     = list(title = "Daily Return (%)", ticksuffix = "%"),
-    hovermode = "x unified",
-    bargap    = 0
-  )
-```
-
-```{r}
-#| label: cum_pnl_chart
-
-pnl_df2 <- test_combined %>%
-  mutate(
-    cum_strat = (cumprod(1 + port_ret_net) - 1) * 100,
-    cum_spy   = (cumprod(1 + spy_c2c)      - 1) * 100
-  )
-
-# Figure 7b: Cumulative return vs SPY
-plot_ly(pnl_df2, x = ~date) %>%
-  add_lines(y = ~cum_strat, name = "Strategy",
-            line = list(color = "#1565c0", width = 2),
-            hovertemplate = "%{x}<br>Strategy: %{y:.1f}%<extra></extra>") %>%
-  add_lines(y = ~cum_spy, name = "SPY",
-            line = list(color = "#b71c1c", width = 2),
-            hovertemplate = "%{x}<br>SPY: %{y:.1f}%<extra></extra>") %>%
-  plotly::layout(
-    title     = "Figure 7b: Cumulative Return — Strategy vs SPY (Testing Period)",
-    xaxis     = list(title = ""),
-    yaxis     = list(title = "Cumulative Return (%)", ticksuffix = "%"),
-    hovermode = "x unified",
-    legend    = list(x = 0.01, y = 0.99)
-  )
 ```
 
 I also examine rolling correlation to SPY, which measures the strategy's diversification value relative to a passive index. A strategy with low or negative correlation adds something beyond what SPY already provides.
@@ -1122,7 +1085,6 @@ kable(stress_table,
 ```{r}
 #| label: stress_cum_chart
 
-# Pre-compute cumulative returns for all scenarios
 sc_test_base  <- test_combined      %>% mutate(cum = (cumprod(1 + port_ret_net) - 1) * 100,
                                                spy_cum = (cumprod(1 + spy_c2c) - 1) * 100)
 sc_test_2x    <- stress_combined_2x %>% mutate(cum = (cumprod(1 + port_ret_net) - 1) * 100)
@@ -1131,66 +1093,69 @@ sc_train_base <- train_combined     %>% mutate(cum = (cumprod(1 + port_ret_net) 
 sc_no_gfc     <- combined_no_gfc    %>% mutate(cum = (cumprod(1 + port_ret_net) - 1) * 100)
 sc_no_covid   <- combined_no_covid  %>% mutate(cum = (cumprod(1 + port_ret_net) - 1) * 100)
 
-# Trace order (7 traces):
-# 0 Test: Baseline   1 Test: 2x TC   2 SPY (Test)
-# 3 Train: Baseline  4 Train: excl. GFC  5 Train: excl. COVID  6 SPY (Train)
+# Figure 9a: Transaction cost sensitivity (test period)
 plot_ly() %>%
-  # ── Test period traces (visible by default) ──────────────────────────────
-  add_lines(x = sc_test_base$date,  y = sc_test_base$cum,
-            name = "Test: Baseline",
-            visible = TRUE, line = list(color = "#1565c0", width = 2)) %>%
-  add_lines(x = sc_test_2x$date,    y = sc_test_2x$cum,
-            name = "Test: 2\u00d7 TC",
-            visible = TRUE, line = list(color = "#e65100", width = 2, dash = "dash")) %>%
-  add_lines(x = sc_test_base$date,  y = sc_test_base$spy_cum,
-            name = "SPY (Test)",
-            visible = TRUE, line = list(color = "#757575", width = 1.5, dash = "dot")) %>%
-  # ── Training period traces (hidden by default) ────────────────────────────
-  add_lines(x = sc_train_base$date, y = sc_train_base$cum,
-            name = "Train: Baseline",
-            visible = FALSE, line = list(color = "#1565c0", width = 2)) %>%
-  add_lines(x = sc_no_gfc$date,     y = sc_no_gfc$cum,
-            name = "Train: excl. GFC",
-            visible = FALSE, line = list(color = "#6a1b9a", width = 2, dash = "dash")) %>%
-  add_lines(x = sc_no_covid$date,   y = sc_no_covid$cum,
-            name = "Train: excl. COVID",
-            visible = FALSE, line = list(color = "#00695c", width = 2, dash = "dash")) %>%
-  add_lines(x = sc_train_base$date, y = sc_train_base$spy_cum,
-            name = "SPY (Train)",
-            visible = FALSE, line = list(color = "#757575", width = 1.5, dash = "dot")) %>%
+  add_lines(x = sc_test_base$date, y = sc_test_base$cum,
+            name = "Baseline (0.05% TC)",
+            line = list(color = "#1565c0", width = 2)) %>%
+  add_lines(x = sc_test_2x$date,   y = sc_test_2x$cum,
+            name = "Double TC (0.10%)",
+            line = list(color = "#e65100", width = 2, dash = "dash")) %>%
+  add_lines(x = sc_test_base$date, y = sc_test_base$spy_cum,
+            name = "SPY",
+            line = list(color = "#757575", width = 1.5, dash = "dot")) %>%
   plotly::layout(
-    title     = "Figure 9: Stress Test — Cumulative Returns by Scenario",
+    title     = "Figure 9a: TC Sensitivity — Baseline vs 2\u00d7 TC (Testing Period)",
     xaxis     = list(title = ""),
     yaxis     = list(title = "Cumulative Return (%)", ticksuffix = "%"),
     hovermode = "x unified",
-    legend    = list(x = 0.01, y = 0.99),
-    updatemenus = list(
-      list(
-        type       = "buttons",
-        direction  = "right",
-        x          = 0.0,
-        y          = 1.15,
-        showactive = TRUE,
-        buttons    = list(
-          list(
-            label  = "Test Period",
-            method = "update",
-            args   = list(
-              list(visible = list(TRUE, TRUE, TRUE, FALSE, FALSE, FALSE, FALSE)),
-              list(title   = "Figure 9: Stress Test — Test Period Scenarios")
-            )
-          ),
-          list(
-            label  = "Training Period",
-            method = "update",
-            args   = list(
-              list(visible = list(FALSE, FALSE, FALSE, TRUE, TRUE, TRUE, TRUE)),
-              list(title   = "Figure 9: Stress Test — Training Period Scenarios")
-            )
-          )
-        )
-      )
-    )
+    legend    = list(x = 0.01, y = 0.99)
+  )
+```
+
+```{r}
+#| label: stress_gfc_chart
+
+# Figure 9b: GFC exclusion (training period)
+plot_ly() %>%
+  add_lines(x = sc_train_base$date, y = sc_train_base$cum,
+            name = "Training Baseline",
+            line = list(color = "#1565c0", width = 2)) %>%
+  add_lines(x = sc_no_gfc$date,     y = sc_no_gfc$cum,
+            name = "Excl. GFC (2008–2009)",
+            line = list(color = "#6a1b9a", width = 2, dash = "dash")) %>%
+  add_lines(x = sc_train_base$date, y = sc_train_base$spy_cum,
+            name = "SPY",
+            line = list(color = "#757575", width = 1.5, dash = "dot")) %>%
+  plotly::layout(
+    title     = "Figure 9b: GFC Exclusion — Training Baseline vs Excl. GFC",
+    xaxis     = list(title = ""),
+    yaxis     = list(title = "Cumulative Return (%)", ticksuffix = "%"),
+    hovermode = "x unified",
+    legend    = list(x = 0.01, y = 0.99)
+  )
+```
+
+```{r}
+#| label: stress_covid_chart
+
+# Figure 9c: COVID exclusion (training period)
+plot_ly() %>%
+  add_lines(x = sc_train_base$date, y = sc_train_base$cum,
+            name = "Training Baseline",
+            line = list(color = "#1565c0", width = 2)) %>%
+  add_lines(x = sc_no_covid$date,   y = sc_no_covid$cum,
+            name = "Excl. COVID (Feb–Jun 2020)",
+            line = list(color = "#00695c", width = 2, dash = "dash")) %>%
+  add_lines(x = sc_train_base$date, y = sc_train_base$spy_cum,
+            name = "SPY",
+            line = list(color = "#757575", width = 1.5, dash = "dot")) %>%
+  plotly::layout(
+    title     = "Figure 9c: COVID Exclusion — Training Baseline vs Excl. COVID",
+    xaxis     = list(title = ""),
+    yaxis     = list(title = "Cumulative Return (%)", ticksuffix = "%"),
+    hovermode = "x unified",
+    legend    = list(x = 0.01, y = 0.99)
   )
 ```
 
