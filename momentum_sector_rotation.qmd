@@ -379,15 +379,11 @@ compute_metrics <- function(port_ret_vec, spy_ret_vec = NULL, n_sectors = 11,
 }
 ```
 
-I apply a Kalman filter to each sector's daily adjusted close price history to extract a noise-filtered trend velocity. The model specification is a local level plus slope (second-order polynomial) state-space model. The two hidden states are the sector's true underlying price level and its velocity — the rate at which that level is changing. Each new daily price updates both estimates in proportion to how surprising the observation was relative to the prior expectation.
+I apply a Kalman filter (`dlmFilter`, forward-only — not `dlmSmooth`) to each sector's daily adjusted close price. The model is a local level plus slope (second-order polynomial) state-space, tracking two hidden states: the sector's underlying price **level** and its **velocity** — the rate of change of that level. Each new daily price updates both estimates in proportion to how surprising it was relative to the prior.
 
-Three key assumptions underpin the model. First, linearity: the observation is simply the true level plus noise, which holds well for daily prices. Second, Gaussian noise: both the process disturbances and the measurement error are normally distributed. Equity returns have fat tails, so this is an approximation — but the Kalman filter remains effective as a smoother even when normality is imperfect. Third, stationarity of noise variances: the process noise ($Q_1$, $Q_2$) and observation noise ($R$) are assumed constant over time. In practice volatility regimes shift, which is why $Q_2$ is treated as a free parameter to be optimized rather than fixed arbitrarily.
+The key tuning parameter is $Q_2$, the velocity process noise. A small $Q_2$ produces a slow-reacting, long-memory velocity; a large $Q_2$ makes it more reactive to recent moves. This parameter is optimized jointly with $k$ in the grid search. $Q_1$ (level noise) and $R$ (observation noise) are fixed.
 
-Three noise variance parameters control filter behavior. $Q_1$ governs how much random variation is allowed in the underlying price level day to day — fixed at a small value since the true level changes smoothly. $Q_2$ controls how quickly the estimated trend velocity can change, and is the most important tuning parameter: a small $Q_2$ produces a slow-reacting velocity with long memory; a large $Q_2$ makes the velocity react more quickly to recent moves. $R$ is the observation noise, fixed at 1.0 to establish the scaling relationship. The ratio $Q_2 / R$ ultimately drives how responsive the velocity estimate is.
-
-A critical distinction: I use `dlmFilter`, the forward-only algorithm, not `dlmSmooth`. The filter estimates the state on day $t$ using only prices observed through day $t$ — exactly how a real-time system would operate. The smoother runs a backward pass through the full series after it has been observed, incorporating future prices to improve past estimates. Using the smoother in a backtest introduces look-ahead bias. Only `dlmFilter` is used here.
-
-The velocity output is the best estimate at each point in time of how fast the sector's underlying trend is moving. A positive and rising velocity means the sector is accelerating upward; a negative velocity means the trend is pointed downward. Compared to raw returns, the Kalman velocity has three advantages as a clustering feature: it absorbs single-day shocks gradually rather than reversing the signal on one bad headline; it places more weight on recent observations when uncertainty is high and more weight on the prior when conditions are stable; and it produces one clean interpretable number per sector per day, avoiding the arbitrary horizon selection required when constructing lookback return features.
+The velocity output is used as the sole clustering feature because it is a noise-filtered measure of each sector's trend speed — stable enough that a single bad day does not flip the signal, but responsive enough to track genuine trend changes.
 
 ```{r}
 #| label: apply_kalman_train
@@ -428,11 +424,9 @@ spy_ret_train <- spy_train %>%
 
 ## Signals
 
-On each trading day, I run k-means clustering on the eleven Kalman velocity values. K-means partitions them into $k$ groups by minimizing total within-cluster variance on that single dimension. The group with the highest mean velocity is the Bull cluster — those sectors receive a LONG signal executed at the following day's open. All other sectors receive a FLAT signal.
+Each trading day, k-means clusters the eleven sectors by Kalman velocity into $k$ groups. The cluster with the highest mean velocity is the Bull cluster — those sectors receive a LONG signal; all others are FLAT. The cluster count $k$ is a free parameter optimized jointly with $Q_2$.
 
-Using only the Kalman velocity as the clustering feature keeps the regime classification economically interpretable. The algorithm answers one question: which sectors have the strongest upward trend momentum right now? There is no risk of clustering artifacts from mixing features at different scales, and the result — a hard Bull/non-Bull partition — is straightforward to audit and explain. For a one-dimensional feature with eleven observations per day, k-means is both optimal and efficient; the cluster count $k$ is treated as a free parameter optimized jointly with $Q_2$.
-
-When the 10-year minus 2-year Treasury spread (FRED `T10Y2Y`) falls below −0.25%, the strategy skips clustering entirely and holds 100% cash. Rather than forecasting which sectors will be resilient in a recession, I simply remove all market exposure. This is the most conservative response to a yield curve inversion — it avoids the drawdown from holding risky sectors during a broad market selldown, and the historical evidence for inversion preceding recessions is robust enough to justify the rule without further elaboration.
+When the FRED 10Y-2Y spread falls below −0.25%, the yield curve override fires: clustering is skipped and the portfolio goes entirely to cash. This removes market exposure during elevated recession risk rather than attempting to pick resilient sectors in a downturn.
 
 ```{r}
 #| label: default_ranking_inspection
@@ -474,9 +468,9 @@ plot_ly(
   )
 ```
 
-Figure 1 shows which sectors were in the Bull cluster most frequently in each year of the training period under default parameters ($k$ = `r DEFAULT_K`, $Q_2$ = `r DEFAULT_Q_VELOCITY`). Warmer colors indicate more frequent selection. Sectors that dominate in specific years — Energy during oil bull markets, Technology during the 2010s growth cycle — reflect the strategy's momentum-driven nature: it concentrates in whatever is actually trending, rather than allocating based on fixed sector views.
+Figure 1 shows Bull-cluster selection frequency by year under default parameters ($k$ = `r DEFAULT_K`, $Q_2$ = `r DEFAULT_Q_VELOCITY`). Warmer colors indicate more frequent selection.
 
-The complete daily decision process is summarized in the diagrams below.
+The complete daily decision process is summarized in the diagram below.
 
 ```{mermaid}
 %%{init: {'theme': 'base', 'themeVariables': {'primaryColor': '#e3f2fd', 'primaryTextColor': '#0d1b2a', 'primaryBorderColor': '#1565c0', 'lineColor': '#1565c0', 'secondaryColor': '#fff3e0', 'tertiaryColor': '#ffffff'}}}%%
@@ -497,30 +491,6 @@ flowchart TD
     classDef exit  fill:#ffecb3,stroke:#f57f17,color:#4e3400
 ```
 
-```{mermaid}
-%%{init: {'theme': 'base', 'themeVariables': {'primaryColor': '#e3f2fd', 'primaryTextColor': '#0d1b2a', 'primaryBorderColor': '#1565c0', 'lineColor': '#555555'}}}%%
-flowchart LR
-    D1[Daily OHLCV\ntq_get]:::data --> K[Kalman Filter\ndlmFilter]:::kalman
-    D2[FRED T10Y2Y\nyield spread]:::data --> YC{YC inverted?}:::decision
-    K --> CL[K-Means Clustering\nk clusters on kal_velocity]:::cluster
-    CL --> YC
-    YC -- Yes --> FL[ALL FLAT\nCash]:::exit
-    YC -- No  --> LG[LONG Bull Cluster\nEqual weight]:::bull
-    FL --> PT[Portfolio\nLag 1 day · TC 0.05%]:::port
-    LG --> PT
-    PT --> OP[Grid Search\nk x Q · 60 combos]:::opt
-    OP --> EV[Evaluate\nOmega · Sharpe · MaxDD]:::eval
-    classDef data     fill:#fff8e1,stroke:#f9a825,color:#4e3400
-    classDef kalman   fill:#e3f2fd,stroke:#1565c0,color:#0d47a1
-    classDef cluster  fill:#f3e5f5,stroke:#6a1b9a,color:#4a148c
-    classDef decision fill:#ffffff,stroke:#555555,color:#000000
-    classDef bull     fill:#c8e6c9,stroke:#2e7d32,color:#1b5e20
-    classDef exit     fill:#ffecb3,stroke:#f57f17,color:#4e3400
-    classDef port     fill:#e8eaf6,stroke:#283593,color:#1a237e
-    classDef opt      fill:#fce4ec,stroke:#880e4f,color:#4a0020
-    classDef eval     fill:#e0f2f1,stroke:#00695c,color:#003d36
-```
-
 | Condition | Signal | Execution Timing | Return Captured |
 |---|---|---|---|
 | Yield curve inverted (10Y-2Y < -0.25%) | ALL FLAT | Exit all positions at Open$_{T+1}$ | None (hold cash) |
@@ -529,9 +499,7 @@ flowchart LR
 
 ## Trades
 
-Signals are generated at each day's close and executed at the following day's market open. I observe the cluster assignment at close, place orders overnight, and fill at the open. A position is only entered or exited when the signal actually changes — if a sector stays in the Bull cluster for ten consecutive days, there is no trade on days two through ten.
-
-The return type applied on each day depends on the position transition:
+Signals are generated at each day's close and executed at the following day's open. A trade only occurs when the signal changes — a sector that stays in the Bull cluster incurs no transaction cost on hold days. Return type varies by transition:
 
 | Transition | Return Type | Formula | Rationale |
 |---|---|---|---|
@@ -539,9 +507,7 @@ The return type applied on each day depends on the position transition:
 | LONG → LONG (hold) | Close-to-Close (C2C) | Adj Close / Lag(Adj Close) − 1 | Already held at previous close. Earns full overnight gap plus intraday move. |
 | LONG → FLAT (exit) | Close-to-Open (C2O) | Open / Lag(Close) − 1 | Signal flipped overnight. Position sold at open next day — earns only the overnight gap, not the intraday move. |
 
-This three-way decomposition is important for backtest realism. A strategy that always uses C2C returns overstates performance by crediting entry days with overnight gaps that were not captured. Using O2C for hold days misses the overnight gap that a real held position earns. O2C and C2O use raw unadjusted open and close prices; C2C uses adjusted close for accurate long-horizon compounding.
-
-Transaction costs are 0.05% one-way, applied as $|\Delta w_i| \times 0.0005$ per dollar rebalanced. This covers approximately 0.03% bid-ask spread and 0.02% commission, consistent with liquid sector ETFs. Total round-trip cost per entry/exit is 0.10%. Results are reported both gross and net.
+Transaction costs are 0.05% one-way ($|\Delta w_i| \times 0.0005$), covering estimated bid-ask spread and commission. Results are shown gross and net.
 
 ## Training Period
 
@@ -679,32 +645,6 @@ cat("  Training Sharpe   :", round(best_row$sharpe[1], 3), "\n")
 ```
 
 The optimizer selects $k$ = `r OPTIMAL_K` clusters and $Q_2$ = `r OPTIMAL_Q`. These parameters are frozen and applied without adjustment to the test period.
-
-```{r}
-#| label: zscored_metrics
-
-zscored <- opt_results %>%
-  filter(!is.na(omega)) %>%
-  mutate(
-    z_omega   = as.vector(scale(omega)),
-    z_sharpe  = as.vector(scale(sharpe)),
-    z_max_dd  = as.vector(scale(-max_dd)),
-    z_pct_win = as.vector(scale(pct_win))
-  ) %>%
-  arrange(desc(z_omega)) %>%
-  select(k, q, omega, sharpe, max_dd, pct_win, z_omega, z_sharpe, z_max_dd, z_pct_win)
-
-kable(zscored,
-      digits  = 3,
-      caption = "Table 3: Z-Scored Risk Metrics Across Parameter Grid (Training)",
-      format  = "html",
-      col.names = c("k (clusters)","Q","Omega","Sharpe","Max DD","% Win",
-                    "z(Omega)","z(Sharpe)","z(Max DD)","z(% Win)")) %>%
-  kable_styling(bootstrap_options = c("striped","hover","condensed")) %>%
-  row_spec(1, bold = TRUE, background = "#e3f2fd")
-```
-
-Table 3 z-scores all metrics relative to their grid-wide mean and standard deviation, allowing comparison across metrics that are on different scales. Values above zero are above the grid average; values above 1.0 are more than one standard deviation above average. The top-ranked row is the selected parameter combination.
 
 ```{r}
 #| label: refit_optimal
@@ -927,13 +867,6 @@ plot_ly(test_cr, x = ~date) %>%
 ```{r}
 #| label: pa_charts
 
-# Build xts for PerformanceAnalytics functions that need it
-port_xts <- xts(test_combined$port_ret_net, order.by = test_combined$date)
-spy_xts  <- xts(test_combined$spy_c2c,      order.by = test_combined$date)
-both_xts <- na.omit(merge(port_xts, spy_xts))
-colnames(both_xts) <- c("Strategy", "SPY")
-
-# ── Plotly performance dashboard: daily returns + drawdown ──────────────────
 dd_df <- test_combined %>%
   mutate(
     strat_cum = cumprod(1 + port_ret_net),
@@ -944,87 +877,78 @@ dd_df <- test_combined %>%
     bar_color = if_else(daily_pct >= 0, "gain", "loss")
   )
 
-p_ret <- plot_ly(dd_df, x = ~date) %>%
+# Figure 5a: Daily Returns
+plot_ly(dd_df, x = ~date) %>%
   add_bars(y = ~daily_pct, color = ~bar_color,
            colors = c("gain" = "#1b5e20", "loss" = "#b71c1c"),
            showlegend = FALSE,
            hovertemplate = "%{x}<br>Daily: %{y:.2f}%<extra></extra>") %>%
   plotly::layout(
+    title     = "Figure 5a: Daily Returns — Strategy (Testing Period)",
     yaxis     = list(title = "Daily Return (%)", ticksuffix = "%"),
-    xaxis     = list(title = "", showticklabels = FALSE),
+    xaxis     = list(title = ""),
     hovermode = "x unified",
     bargap    = 0
   )
+```
 
-p_dd <- plot_ly(dd_df, x = ~date) %>%
+```{r}
+#| label: drawdown_chart
+
+# Figure 5b: Drawdown
+dd_df2 <- test_combined %>%
+  mutate(
+    strat_cum = cumprod(1 + port_ret_net),
+    spy_cum   = cumprod(1 + spy_c2c),
+    strat_dd  = (strat_cum - cummax(strat_cum)) / cummax(strat_cum) * 100,
+    spy_dd    = (spy_cum   - cummax(spy_cum))   / cummax(spy_cum)   * 100
+  )
+
+plot_ly(dd_df2, x = ~date) %>%
   add_lines(y = ~strat_dd, name = "Strategy",
-            line = list(color = "#1565c0", width = 1.5)) %>%
+            line = list(color = "#1565c0", width = 2)) %>%
   add_lines(y = ~spy_dd,   name = "SPY",
-            line = list(color = "#b71c1c", width = 1.5)) %>%
+            line = list(color = "#b71c1c", width = 2)) %>%
   plotly::layout(
+    title     = "Figure 5b: Drawdown — Strategy vs SPY (Testing Period)",
     yaxis     = list(title = "Drawdown (%)", ticksuffix = "%"),
     xaxis     = list(title = ""),
     hovermode = "x unified",
     legend    = list(x = 0.01, y = 0.05)
   )
-
-subplot(p_ret, p_dd, nrows = 2, shareX = TRUE, titleY = TRUE,
-        heights = c(0.45, 0.55)) %>%
-  plotly::layout(
-    title = "Figure 5: Performance Dashboard — Daily Returns & Drawdown (Testing Period)"
-  )
-```
-
-```{r}
-#| label: monthly_holdings
-
-# Which sectors were held each month (test period)
-monthly_holdings <- test_signals %>%
-  filter(signal == "LONG") %>%
-  mutate(ym = floor_date(date, "month")) %>%
-  group_by(ym) %>%
-  summarise(
-    held_sectors = paste(sort(unique(symbol)), collapse = ", "),
-    n_held       = n_distinct(symbol),
-    .groups      = "drop"
-  )
-
-kable(monthly_holdings,
-      col.names = c("Month","Sectors Held","# Sectors"),
-      caption   = "Table 6: Monthly Holdings — Testing Period",
-      format    = "html") %>%
-  kable_styling(bootstrap_options = c("striped","hover","condensed"))
 ```
 
 ```{r}
 #| label: positions_chart
+#| fig-height: 4
 
-# Heatmap: which sectors were LONG on each day of the test period
-pos_df <- test_signals %>%
-  mutate(held = as.integer(signal == "LONG"))
-
-pos_wide <- pos_df %>%
-  select(date, symbol, held) %>%
-  pivot_wider(names_from = symbol, values_from = held, values_fill = 0)
-
-pos_mat  <- as.matrix(pos_wide[, -1])
-rownames(pos_mat) <- as.character(pos_wide$date)
-
-plot_ly(
-  x          = colnames(pos_mat),
-  y          = rownames(pos_mat),
-  z          = t(pos_mat),
-  type       = "heatmap",
-  colorscale = list(c(0, "#f5f5f5"), c(1, "#1565c0")),
-  showscale  = FALSE,
-  hovertemplate = "<b>%{x}</b><br>%{y}<br>%{z:d} (1=LONG, 0=FLAT)<extra></extra>"
-) %>%
-  plotly::layout(
-    title  = "Figure 6: Sector Positions Held — Testing Period",
-    xaxis  = list(title = ""),
-    yaxis  = list(title = "", autorange = "reversed",
-                  tickfont = list(size = 9))
+# Tile chart: each row = one sector, each column = one day, blue = LONG
+pos_tile <- test_signals %>%
+  mutate(
+    held   = signal == "LONG",
+    symbol = factor(symbol, levels = rev(sort(unique(symbol))))
   )
+
+p_tile <- ggplot(pos_tile, aes(x = date, y = symbol, fill = held)) +
+  geom_tile(width = 1, height = 0.85) +
+  scale_fill_manual(
+    values = c("TRUE" = "#1565c0", "FALSE" = "#eeeeee"),
+    labels = c("TRUE" = "LONG", "FALSE" = "FLAT"),
+    name   = ""
+  ) +
+  scale_x_date(date_breaks = "2 months", date_labels = "%b %Y") +
+  labs(title = "Figure 6: Daily Sector Holdings — Testing Period",
+       x = "", y = "") +
+  theme_minimal(base_size = 11) +
+  theme(
+    legend.position  = "top",
+    panel.grid       = element_blank(),
+    axis.text.x      = element_text(angle = 45, hjust = 1),
+    plot.title       = element_text(size = 12)
+  )
+
+ggplotly(p_tile, tooltip = c("x", "y", "fill")) %>%
+  layout(legend = list(orientation = "h", x = 0, y = 1.1))
 ```
 
 ```{r}
@@ -1037,33 +961,47 @@ pnl_df <- test_combined %>%
     bar_color = if_else(daily_pct >= 0, "gain", "loss")
   )
 
+# Figure 7a: Daily P&L bars
 plot_ly(pnl_df, x = ~date) %>%
   add_bars(
     y             = ~daily_pct,
     color         = ~bar_color,
     colors        = c("gain" = "#1b5e20", "loss" = "#b71c1c"),
-    yaxis         = "y",
-    name          = "Daily Return",
-    showlegend    = TRUE,
-    hovertemplate = "%{x}<br>Daily: %{y:.2f}%<extra></extra>",
-    bargap        = 0
-  ) %>%
-  add_lines(
-    y             = ~cum_pct,
-    yaxis         = "y2",
-    name          = "Cumulative Return",
-    line          = list(color = "#1565c0", width = 2),
-    hovertemplate = "%{x}<br>Cumulative: %{y:.1f}%<extra></extra>"
+    showlegend    = FALSE,
+    hovertemplate = "%{x}<br>Daily: %{y:.2f}%<extra></extra>"
   ) %>%
   plotly::layout(
-    title     = "Figure 7: Daily P&L and Cumulative Return — Testing Period",
+    title     = "Figure 7a: Daily P&L — Testing Period",
     xaxis     = list(title = ""),
-    yaxis     = list(title = "Daily Return (%)", ticksuffix = "%", side = "left"),
-    yaxis2    = list(title = "Cumulative Return (%)", ticksuffix = "%",
-                     overlaying = "y", side = "right"),
+    yaxis     = list(title = "Daily Return (%)", ticksuffix = "%"),
     hovermode = "x unified",
-    legend    = list(x = 0.01, y = 0.99),
     bargap    = 0
+  )
+```
+
+```{r}
+#| label: cum_pnl_chart
+
+pnl_df2 <- test_combined %>%
+  mutate(
+    cum_strat = (cumprod(1 + port_ret_net) - 1) * 100,
+    cum_spy   = (cumprod(1 + spy_c2c)      - 1) * 100
+  )
+
+# Figure 7b: Cumulative return vs SPY
+plot_ly(pnl_df2, x = ~date) %>%
+  add_lines(y = ~cum_strat, name = "Strategy",
+            line = list(color = "#1565c0", width = 2),
+            hovertemplate = "%{x}<br>Strategy: %{y:.1f}%<extra></extra>") %>%
+  add_lines(y = ~cum_spy, name = "SPY",
+            line = list(color = "#b71c1c", width = 2),
+            hovertemplate = "%{x}<br>SPY: %{y:.1f}%<extra></extra>") %>%
+  plotly::layout(
+    title     = "Figure 7b: Cumulative Return — Strategy vs SPY (Testing Period)",
+    xaxis     = list(title = ""),
+    yaxis     = list(title = "Cumulative Return (%)", ticksuffix = "%"),
+    hovermode = "x unified",
+    legend    = list(x = 0.01, y = 0.99)
   )
 ```
 
@@ -1184,20 +1122,75 @@ kable(stress_table,
 ```{r}
 #| label: stress_cum_chart
 
-sc_std <- test_combined      %>% mutate(cum = (cumprod(1 + port_ret_net) - 1) * 100)
-sc_2x  <- stress_combined_2x %>% mutate(cum = (cumprod(1 + port_ret_net) - 1) * 100)
+# Pre-compute cumulative returns for all scenarios
+sc_test_base  <- test_combined      %>% mutate(cum = (cumprod(1 + port_ret_net) - 1) * 100,
+                                               spy_cum = (cumprod(1 + spy_c2c) - 1) * 100)
+sc_test_2x    <- stress_combined_2x %>% mutate(cum = (cumprod(1 + port_ret_net) - 1) * 100)
+sc_train_base <- train_combined     %>% mutate(cum = (cumprod(1 + port_ret_net) - 1) * 100,
+                                               spy_cum = (cumprod(1 + spy_c2c) - 1) * 100)
+sc_no_gfc     <- combined_no_gfc    %>% mutate(cum = (cumprod(1 + port_ret_net) - 1) * 100)
+sc_no_covid   <- combined_no_covid  %>% mutate(cum = (cumprod(1 + port_ret_net) - 1) * 100)
 
-plot_ly(x = ~sc_std$date) %>%
-  add_lines(y = ~sc_std$cum, name = "Standard TC (0.05%)",
-            line = list(color = "#1565c0", width = 2)) %>%
-  add_lines(y = ~sc_2x$cum,  name = "Double TC (0.10%)",
-            line = list(color = "#e65100", width = 2, dash = "dash")) %>%
+# Trace order (7 traces):
+# 0 Test: Baseline   1 Test: 2x TC   2 SPY (Test)
+# 3 Train: Baseline  4 Train: excl. GFC  5 Train: excl. COVID  6 SPY (Train)
+plot_ly() %>%
+  # ── Test period traces (visible by default) ──────────────────────────────
+  add_lines(x = sc_test_base$date,  y = sc_test_base$cum,
+            name = "Test: Baseline",
+            visible = TRUE, line = list(color = "#1565c0", width = 2)) %>%
+  add_lines(x = sc_test_2x$date,    y = sc_test_2x$cum,
+            name = "Test: 2\u00d7 TC",
+            visible = TRUE, line = list(color = "#e65100", width = 2, dash = "dash")) %>%
+  add_lines(x = sc_test_base$date,  y = sc_test_base$spy_cum,
+            name = "SPY (Test)",
+            visible = TRUE, line = list(color = "#757575", width = 1.5, dash = "dot")) %>%
+  # ── Training period traces (hidden by default) ────────────────────────────
+  add_lines(x = sc_train_base$date, y = sc_train_base$cum,
+            name = "Train: Baseline",
+            visible = FALSE, line = list(color = "#1565c0", width = 2)) %>%
+  add_lines(x = sc_no_gfc$date,     y = sc_no_gfc$cum,
+            name = "Train: excl. GFC",
+            visible = FALSE, line = list(color = "#6a1b9a", width = 2, dash = "dash")) %>%
+  add_lines(x = sc_no_covid$date,   y = sc_no_covid$cum,
+            name = "Train: excl. COVID",
+            visible = FALSE, line = list(color = "#00695c", width = 2, dash = "dash")) %>%
+  add_lines(x = sc_train_base$date, y = sc_train_base$spy_cum,
+            name = "SPY (Train)",
+            visible = FALSE, line = list(color = "#757575", width = 1.5, dash = "dot")) %>%
   plotly::layout(
-    title     = "Figure 9: Transaction Cost Sensitivity — Testing Period",
+    title     = "Figure 9: Stress Test — Cumulative Returns by Scenario",
     xaxis     = list(title = ""),
     yaxis     = list(title = "Cumulative Return (%)", ticksuffix = "%"),
     hovermode = "x unified",
-    legend    = list(x = 0.01, y = 0.99)
+    legend    = list(x = 0.01, y = 0.99),
+    updatemenus = list(
+      list(
+        type       = "buttons",
+        direction  = "right",
+        x          = 0.0,
+        y          = 1.15,
+        showactive = TRUE,
+        buttons    = list(
+          list(
+            label  = "Test Period",
+            method = "update",
+            args   = list(
+              list(visible = list(TRUE, TRUE, TRUE, FALSE, FALSE, FALSE, FALSE)),
+              list(title   = "Figure 9: Stress Test — Test Period Scenarios")
+            )
+          ),
+          list(
+            label  = "Training Period",
+            method = "update",
+            args   = list(
+              list(visible = list(FALSE, FALSE, FALSE, TRUE, TRUE, TRUE, TRUE)),
+              list(title   = "Figure 9: Stress Test — Training Period Scenarios")
+            )
+          )
+        )
+      )
+    )
   )
 ```
 
