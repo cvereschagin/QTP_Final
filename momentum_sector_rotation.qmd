@@ -1,19 +1,16 @@
 ---
-title: "Momentum-Driven Sector Rotation via Kalman Filtering and Cross-Sectional Ranking"
+title: "Momentum-Driven Sector Rotation via Kalman Filtering and K-Means Clustering"
 subtitle: "FIN452 Quantitative Trading Project"
 author: "Carter Vereschagin"
 date: today
 format:
   html:
     embed-resources: true
-    toc: true
-    toc-depth: 3
-    toc-float: true
+    toc: false
     theme: flatly
     fig-width: 10
     fig-height: 6
     df-print: paged
-    number-sections: true
 execute:
   echo: false
   warning: false
@@ -41,7 +38,6 @@ library(foreach)            # foreach() %dopar%
 library(plotly)             # interactive charts
 library(ggplot2)
 library(scales)
-library(DiagrammeR)
 
 # --- Data Wrangling ---
 library(dplyr)
@@ -80,7 +76,7 @@ DEFAULT_R_OBS      <- 1.0
 
 # Strategy parameters
 DEFAULT_K         <- 3                         # default number of k-means clusters
-K_GRID            <- 2:5                       # grid search range for k
+K_GRID            <- 2:6                       # grid search range for k
 YC_THRESHOLD      <- -0.0025                   # 10Y-2Y < -0.25% → go to cash (all FLAT)
 
 # Known ETF launch dates (important for data coverage disclosure)
@@ -90,92 +86,33 @@ XLRE_LAUNCH <- as.Date("2015-10-07")
 
 ---
 
-# Executive Summary
+# Strategy
 
-This project implements a **daily momentum-driven sector rotation strategy** applied to the eleven S&P 500 Select Sector SPDR ETFs (XLB, XLC, XLE, XLF, XLI, XLK, XLP, XLRE, XLV, XLU, XLY), benchmarked against SPY. Each trading day, a **Kalman Filter** is applied to each sector's adjusted close history to extract a noise-filtered trend velocity. Sectors are **clustered daily by k-means** on this velocity into $k$ momentum regimes; the cluster with the highest mean velocity — the "Bull cluster" — defines which sectors to hold. Positions are entered, held, and exited based on daily changes in cluster membership, with execution at the next day's market open. A **yield curve overlay** (FRED 10Y-2Y spread) moves the portfolio entirely to cash during yield curve inversions. Parameters $k$ (number of clusters) and $Q_2$ (Kalman velocity noise) are jointly optimized on training data (June 2000 – December 2024) using a granular grid search. Out-of-sample evaluation covers January 2025 through March 2026.
+## Description
 
----
+This project implements a daily momentum-driven sector rotation strategy applied to the eleven S&P 500 Select Sector SPDR ETFs — XLB, XLC, XLE, XLF, XLI, XLK, XLP, XLRE, XLV, XLU, and XLY — benchmarked against SPY. The strategy runs every trading day. A Kalman filter is applied to each sector's adjusted close price series to extract a noise-filtered trend velocity. Those velocities are then passed into a k-means clustering algorithm that partitions all eleven sectors into momentum regimes. The cluster with the highest average velocity — the Bull cluster — defines which sectors to hold that day. When the FRED 10-year minus 2-year Treasury spread falls below −0.25%, indicating yield curve inversion, the strategy exits all positions entirely and holds cash. Positions are sized equally among Bull cluster sectors and executed at the following morning's market open.
 
-# Introduction & Hypothesis
+The training period spans June 2000 through December 2024 — 24.5 years including two major bear markets, the global financial crisis, a pandemic crash, and a rate hike cycle. The out-of-sample test period covers January 2025 through March 2026 and was completely sealed during model development. Two free parameters, the number of clusters $k$ and the Kalman velocity noise $Q_2$, are jointly optimized on training data using a 5 × 12 grid search evaluated by Omega ratio.
 
-## Sector Rotation and the Business Cycle
+## Rationale
 
-Equity markets do not move uniformly across sectors. The business cycle theory (Fama & French, 1989; Stovall, 1996) proposes that different sectors tend to outperform at different stages of the economic cycle:
+The core intuition is that equity sectors exhibit persistent momentum. Sectors trending strongly today tend to continue trending strongly in the near term, and sectors in downtrends tend to remain weak. Rather than attempting to forecast which sectors will outperform based on macroeconomic views, this strategy simply measures trend momentum as objectively as possible and holds the strongest-trending sectors each day.
 
-| Cycle Phase | Typically Outperforming Sectors |
-|---|---|
-| Early Expansion | XLF (Financials), XLY (Consumer Discretionary) |
-| Mid Expansion | XLI (Industrials), XLK (Technology), XLC (Communication) |
-| Late Expansion | XLE (Energy), XLB (Materials) |
-| Contraction / Defensive | XLU (Utilities), XLP (Consumer Staples), XLV (Health Care) |
+The Kalman filter's role is noise reduction before clustering. Raw daily returns are dominated by single-day shocks — macro headlines, fund flows, temporary imbalances — that do not reflect genuine trend reversals. Clustering on raw returns generates excessive turnover as sectors bounce in and out of the Bull cluster on noise rather than signal. The Kalman velocity filters out these transient shocks by maintaining a running estimate of each sector's underlying trend speed, updating conservatively when a new price is consistent with the prior trend and more aggressively when a sustained directional move accumulates. Clustering on this denoised velocity produces more stable daily assignments and lower unnecessary turnover.
 
-A sector rotation strategy attempts to be positioned in the sectors most likely to outperform during the current phase of the cycle.
+The yield curve overlay provides a macro-grounded defensive mechanism. Rather than trying to pick which sectors will hold up in a recessionary environment — a second prediction problem layered on top of the momentum signal — I simply exit the market entirely when the probability of a broad economic contraction is elevated. The 10Y-2Y spread has preceded every US recession since the 1960s, making it the cleanest and most widely-validated leading indicator available at daily frequency without data access costs.
 
-## Academic Foundation
+## Research
 
-Moskowitz & Grinblatt (1999, *Journal of Finance*) demonstrated that **industry-level momentum** — the tendency for recently outperforming industries to continue outperforming — is statistically significant and economically large, explaining a substantial fraction of individual stock momentum. Critically, industry momentum profits are concentrated on the long side (winning industries), making a long-only implementation viable. Faber (2010, SSRN 1585517) tested relative-strength ranking directly on sector ETF-equivalent data back to the 1920s, confirming profitability across all lookback windows from 1 to 12 months and showing that a trend-following overlay reduces drawdowns. Moskowitz, Ooi & Pedersen (2012, *Journal of Financial Economics*) further established **time-series momentum** — each asset's own past return predicting its own future return — providing the theoretical basis for using a sector's individual velocity signal rather than only cross-sectional rank.
+Moskowitz & Grinblatt (1999, *Journal of Finance*) demonstrated that industry-level momentum is statistically significant and economically large, and that the profits are concentrated on the long side — validating a long-only implementation. Faber (2010, SSRN 1585517) tested relative-strength sector rotation on SPDR-equivalent data back to the 1920s and found it profitable across all lookback windows from one to twelve months, with a trend-following overlay reducing drawdowns substantially. Moskowitz, Ooi & Pedersen (2012, *Journal of Financial Economics*) established time-series momentum — each asset's own past return predicting its own future return — providing the theoretical basis for using each sector's individual velocity signal rather than only cross-sectional comparisons.
 
-## Strategy Innovation
-
-This project extends the standard rank-based momentum approach in two ways:
-
-1. **Kalman Velocity as Clustering Feature**: Instead of clustering sectors on raw historical returns or arbitrary technical indicators, the Kalman Filter first extracts a noise-filtered trend velocity for each sector. K-means then clusters sectors by this single, economically interpretable signal — partitioning them into momentum regimes (Bull/Bear). Using a denoised signal prevents single-day outliers from distorting cluster assignments.
-
-2. **Yield Curve Regime Overlay**: The 10Y-2Y Treasury yield spread — a well-documented leading indicator of US recessions (Chicago Fed, 2018; Gilchrist & Zakrajsek, 2012 *AER*) — provides a macro anchor. When the yield curve inverts below -0.25%, the strategy exits all positions and holds cash entirely. This preserves capital during late-cycle risk-off conditions without requiring a forecast of which sectors will outperform in the downturn.
+For the macro overlay, Estrella & Mishkin (1998, *Review of Economics and Statistics*) documented the yield curve's predictive power for US recessions, and the Chicago Fed (2018) confirmed that the 10Y-2Y spread has an essentially perfect historical track record as a leading recession indicator. This body of evidence grounds the yield curve filter in peer-reviewed research rather than ad hoc rule-setting.
 
 ---
 
-# Mental Model
+# Model Implementation
 
-## Decision Flowchart
-
-The following diagram illustrates the complete daily decision process:
-
-```{r}
-#| label: flowchart_decision
-DiagrammeR::grViz("
-digraph decision_flow {
-  graph [layout = dot, rankdir = TB, bgcolor = '#ffffff', fontname = 'Helvetica']
-  node  [fontname = 'Helvetica', fontsize = 12, style = filled, shape = box]
-  edge  [fontname = 'Helvetica', fontsize = 10]
-
-  A [label = 'Daily Close',             shape = oval,    fillcolor = '#1565c0', fontcolor = white]
-  B [label = 'Apply Kalman Filter\\n(dlmFilter — forward pass only)', fillcolor = '#e3f2fd', color = '#1565c0']
-  C [label = 'Extract kal_velocity\\n(noise-filtered trend slope)',   fillcolor = '#e3f2fd', color = '#1565c0']
-  D [label = 'Yield Curve Inverted?\\n10Y-2Y < -0.25%',  shape = diamond, fillcolor = '#ffffff', color = '#555555']
-  E [label = 'ALL FLAT\\nGo to Cash',   fillcolor = '#ffecb3', color = '#f57f17']
-  F [label = 'K-Means Clustering\\nk clusters on kal_velocity', fillcolor = '#f3e5f5', color = '#6a1b9a']
-  G [label = 'Identify Bull Cluster\\n(highest mean velocity)',  fillcolor = '#c8e6c9', color = '#2e7d32']
-  H [label = 'LONG Bull Cluster\\nEqual Weight',                 fillcolor = '#c8e6c9', color = '#2e7d32']
-  I [label = 'Apply TC: 0.05%\\nper unit weight change',         fillcolor = '#e8eaf6', color = '#283593']
-  J [label = 'Execute at Open T+1',     shape = oval,    fillcolor = '#1565c0', fontcolor = white]
-
-  A -> B -> C -> D
-  D -> E [label = 'Yes']
-  D -> F [label = 'No']
-  F -> G -> H
-  E -> I
-  H -> I
-  I -> J -> A
-}
-")
-```
-
-## Decision Rules
-
-| Condition | Signal | Execution Timing | Return Captured |
-|---|---|---|---|
-| Yield curve inverted (10Y-2Y < -0.25%) | ALL FLAT | Exit all positions at Open$_{T+1}$ | None (hold cash) |
-| Yield curve normal AND sector in Bull cluster | LONG | Buy at Open$_{T+1}$ | Open-to-Close on $T+1$ |
-| Yield curve normal AND sector NOT in Bull cluster | FLAT | Sell (if held) at Open$_{T+1}$ | None (cash = 0%) |
-
-The strategy is **long-only** with **daily signal generation**. The cluster is re-evaluated every trading day using the latest Kalman velocity; a position is only entered or exited when the signal actually changes, so transaction costs are proportional to realized turnover rather than a fixed calendar schedule.
-
----
-
-# Data
-
-## Symbols and Date Ranges
+## Data
 
 ```{r}
 #| label: data_download
@@ -202,7 +139,7 @@ yc_raw <- tq_get(
   mutate(yield_spread = yield_spread / 100)   # convert from percentage points to decimal
 ```
 
-## Data Coverage and Quality
+I download daily OHLCV price data for all eleven sector ETFs and SPY from Yahoo Finance using `tidyquant::tq_get()`, and the FRED T10Y2Y series for the yield curve overlay. XLC (Communication Services) launched on `r format(XLC_LAUNCH, "%B %d, %Y")` and XLRE (Real Estate) launched on `r format(XLRE_LAUNCH, "%B %d, %Y")`; prior to those dates those sectors are simply absent from the clustering universe, and k-means operates on the available subset.
 
 ```{r}
 #| label: data_quality
@@ -227,15 +164,7 @@ kable(coverage,
   row_spec(which(coverage$symbol %in% c("XLC","XLRE")), background = "#fff3cd")
 ```
 
-::: {.callout-note title="ETF Launch Dates"}
-**XLC** (Communication Services) launched `r format(XLC_LAUNCH, "%B %d, %Y")`. **XLRE** (Real Estate) launched `r format(XLRE_LAUNCH, "%B %d, %Y")`. Prior to each ETF's launch date, that sector is simply absent from the clustering universe — k-means operates only on available sectors, and the Bull cluster is identified from the available set. No values are imputed or fabricated.
-:::
-
-::: {.callout-warning title="Adjusted Price Caveat"}
-Yahoo Finance computes `adjusted` close using the **full forward history** of dividends and splits — i.e., the adjustment factor for January 2001 incorporates dividends paid in 2010. This creates a minor look-ahead bias in the feature engineering (momentum signals use adjusted close). This is standard practice in academic finance and is disclosed here. The impact is small for sector ETFs, which pay modest quarterly dividends and rarely split.
-:::
-
-## Data Split
+I use the `adjusted` close from Yahoo Finance for the Kalman filter and C2C returns. Yahoo computes adjusted prices using the full forward history of dividends and splits, which introduces a minor look-ahead bias in the feature engineering. This is standard practice in academic finance and the impact is small for sector ETFs, which pay modest quarterly dividends and rarely split.
 
 ```{r}
 #| label: data_split
@@ -263,139 +192,9 @@ cat("Training date range:", format(min(train_all$date)), "–", format(max(train
 cat("Testing date range:",  format(min(test_all$date)),  "–", format(max(test_all$date)),  "\n")
 ```
 
-> **Look-ahead firewall**: `test_all`, `sector_test`, and `spy_test` are created here but not accessed again until Section 9. All model fitting, parameter selection, and normalization statistics are derived exclusively from training data.
+The training and test splits are created here and the test set is not accessed again until the Performance section. All model fitting, parameter selection, and normalization are derived exclusively from training data.
 
----
-
-# Methodology
-
-## 5.1 Kalman Filter — Extracting Noise-Filtered Trend Velocity
-
-### What the Kalman Filter Does and Its Key Assumptions
-
-Every daily price contains both genuine trend information and random noise — macro headlines, fund flows, temporary supply/demand imbalances. The Kalman Filter is a sequential state estimation algorithm that separates the two. It treats each observed price as a noisy measurement of an underlying hidden state that cannot be directly observed, and at each new data point it updates its estimate of that hidden state in an optimal way — optimal meaning it minimises the mean squared error of the estimate given all information up to that point.
-
-The model used here is a **local level plus slope** (second-order polynomial) specification. The two hidden state variables are the sector's true underlying price level and its **velocity** — the rate at which that level is changing. The observed daily price is treated as the true level plus random measurement noise. The level evolves by adding the velocity each day, and the velocity itself can drift slightly over time.
-
-For this model to be applied meaningfully, three key assumptions must hold approximately:
-
-- **Linearity**: the relationship between the state and the observation is linear. Daily prices satisfy this reasonably well since we are simply measuring the level plus noise.
-- **Gaussian noise**: both the process disturbances and measurement noise are normally distributed. Equity returns have fat tails, so this is an approximation — but the Kalman filter remains effective as a smoother even when this assumption is imperfect.
-- **Stationarity of noise variances**: the process and observation noise levels ($Q_1$, $Q_2$, $R$) are assumed constant over time. In practice volatility regimes change, which is why we optimize $Q_2$ on training data rather than fixing it arbitrarily.
-
-### Parameters
-
-Three noise variance parameters control the filter's behavior:
-
-- **$Q_1$ (level process noise)**: how much random variation is allowed in the underlying price level from one day to the next. Fixed at a small value since the true level changes smoothly.
-- **$Q_2$ (velocity process noise)**: how quickly the estimated trend direction can change. This is the most important tuning parameter. A small $Q_2$ produces a slow-reacting, long-memory velocity that captures structural trends; a large $Q_2$ produces a fast-reacting velocity that responds more to recent moves. This parameter is optimized jointly with $k$ in the grid search.
-- **$R$ (observation noise)**: how noisy the daily price is as a measurement of the true level. Fixed at 1.0 relative to process noise — this establishes the scaling relationship and the filter adapts from there.
-
-The ratio $Q_2 / R$ ultimately drives how responsive the velocity estimate is. A high ratio means the filter trusts recent price changes more than its prior estimate; a low ratio means it relies more heavily on its prior, producing a smoother signal.
-
-### Filter vs. Smoother — A Critical Distinction
-
-The Kalman **filter** (`dlmFilter`) is a strictly forward-only algorithm. When estimating the state on day $t$, it uses only prices observed on days 1 through $t$. This is exactly how a real-time trading system would operate — you only know what has happened so far.
-
-The Kalman **smoother** (`dlmSmooth`) runs an additional backward pass through the data after the full series has been seen. This produces more accurate estimates of what the state was at each past point in time, but it does so using information from the future — prices that had not yet occurred when the signal would have been generated. Using the smoother in a backtest introduces look-ahead bias and will overstate the quality of the signal. **Only `dlmFilter` is used in this analysis.**
-
-### Why Velocity is the Primary Clustering Feature
-
-The velocity output of the filter is the best estimate of how fast the sector's underlying trend is moving at each point in time. A positive and rising velocity means the sector is accelerating upward; a negative velocity means the trend is pointed downward. Compared to raw daily or monthly returns, the Kalman velocity has three advantages as a clustering input:
-
-1. **Noise resistance**: single-day price shocks are absorbed by the filter gradually rather than causing an immediate spike. A sector that drops 4% on a headline will not have its velocity reversed overnight — the filter updates proportionally to how surprising that move was relative to its prior uncertainty.
-2. **Adaptive memory**: the filter automatically places more weight on recent observations when uncertainty is high and more weight on the prior when conditions are stable. This means the velocity adapts faster in volatile regimes and more slowly in trending regimes — a desirable property for a momentum signal.
-3. **Single interpretable number**: each sector produces one velocity value per day that directly means "how fast is this sector's trend moving." This is a cleaner clustering input than a vector of returns at different lookback horizons, where the choice of horizons introduces additional arbitrary parameters.
-
-## 5.2 K-Means Clustering on Kalman Velocity
-
-On each trading day, the Kalman velocity for each of the 11 sectors is extracted and used as the **sole feature** for k-means clustering. K-means partitions the sectors into $k$ groups by minimizing the total within-cluster variance on that single velocity dimension. The cluster with the highest mean Kalman velocity is designated the **Bull cluster**; all sectors assigned to it receive a LONG signal executed at the following day's open. All other sectors receive a FLAT signal and are held as cash if currently owned, with exit executed at the following day's open.
-
-**Why k-means on a single feature?** Using only the Kalman velocity keeps the clustering economically interpretable — the algorithm is purely partitioning sectors into momentum regimes based on their noise-filtered trend speed. There is no risk of clustering artifacts from mixing features with different scales or units. The result is a hard regime classifier: sectors are either trending up (Bull) or not, which is straightforward to explain and audit.
-
-**Why Kalman velocity rather than raw returns?** Raw returns are dominated by single-day outliers. The Kalman velocity is an adaptive weighted average of the price history, placing more weight on recent observations while retaining memory of the longer-term trend. Clustering on this denoised signal produces more stable daily assignments and reduces unnecessary turnover relative to clustering on raw returns.
-
-**Why k-means rather than hierarchical or DBSCAN?** For a one-dimensional feature with 11 sectors per day, k-means is both optimal and efficient. DBSCAN would be ill-conditioned on 11 points in one dimension, and hierarchical clustering adds no information beyond what k-means provides at this scale. The cluster count $k$ is treated as a free parameter optimized jointly with $Q_2$.
-
-## 5.3 Yield Curve Macro Filter
-
-The 10-year minus 2-year US Treasury spread (FRED series `T10Y2Y`) is one of the most-studied macroeconomic leading indicators. When this spread turns negative — meaning short-term rates exceed long-term rates — it has preceded every US recession since the 1960s (Estrella & Mishkin 1998; Chicago Fed 2018).
-
-When the spread falls below $-0.25\%$, the strategy exits all positions and holds cash. Rather than forecasting which sectors will be resilient — a second prediction problem layered on top of the momentum signal — the strategy simply removes market exposure entirely. This is the most conservative response to a yield curve inversion: it avoids the drawdown from holding risky sectors during a recession, while also avoiding the complexity of defending a specific sector selection in the risk-off regime.
-
-This filter transforms the strategy from pure price-momentum to a **macro-conditioned momentum strategy**, grounding the risk-off behavior in economic theory rather than technical signals alone.
-
-## 5.4 Signal Pipeline and Execution
-
-```{r}
-#| label: flowchart_pipeline
-DiagrammeR::grViz("
-digraph pipeline {
-  graph [layout = dot, rankdir = LR, bgcolor = '#ffffff', fontname = 'Helvetica', nodesep = 0.4, ranksep = 0.5]
-  node  [fontname = 'Helvetica', fontsize = 11, style = filled, shape = box]
-  edge  [fontname = 'Helvetica', fontsize = 9]
-
-  D1 [label = 'Daily OHLCV\\ntq_get',         fillcolor = '#fff8e1', color = '#f9a825']
-  D2 [label = 'FRED T10Y2Y\\nyield spread',    fillcolor = '#fff8e1', color = '#f9a825']
-  K  [label = 'Kalman Filter\\ndlmFilter',     fillcolor = '#e3f2fd', color = '#1565c0']
-  CL [label = 'K-Means Clustering\\nk clusters on kal_velocity', fillcolor = '#f3e5f5', color = '#6a1b9a']
-  YC [label = 'YC Inverted?',  shape = diamond, fillcolor = '#ffffff', color = '#555555']
-  FL [label = 'ALL FLAT\\nCash',               fillcolor = '#ffecb3', color = '#f57f17']
-  LG [label = 'LONG Bull Cluster\\nEqual Weight', fillcolor = '#c8e6c9', color = '#2e7d32']
-  PT [label = 'Portfolio\\nLag 1 day · TC 0.05%', fillcolor = '#e8eaf6', color = '#283593']
-  OP [label = 'Grid Search\\nk x Q · granular', fillcolor = '#fce4ec', color = '#880e4f']
-  EV [label = 'Evaluate\\nOmega · Sharpe · MaxDD', fillcolor = '#e0f2f1', color = '#00695c']
-
-  D1 -> K -> CL -> YC
-  D2 -> YC
-  YC -> FL [label = 'Yes']
-  YC -> LG [label = 'No']
-  FL -> PT
-  LG -> PT
-  PT -> OP -> EV
-}
-")
-```
-
-## 5.5 Trade Execution Timing and Return Types
-
-The timing convention is fundamental to a realistic backtest:
-
-```
-Day T [Close]:   Kalman filter updates velocity → k-means re-clusters all 11 sectors → LONG/FLAT signal
-Day T+1 [Open]:  Execute all changes: new LONG positions entered, FLAT-flipped positions exited
-                 Positions unchanged if sector remains in same cluster → no trade, no TC
-Day T+1 [Close]: Positions earn their respective return for the day
-Day T+2:         Repeat — the cluster is re-evaluated fresh from each day's new velocity
-```
-
-The return type applied on each day depends on the position transition, reflecting the actual cash flow experienced:
-
-| Transition | Return Type | Formula | Rationale |
-|---|---|---|---|
-| FLAT → LONG (entry) | Open-to-Close (O2C) | Close / Open − 1 | Bought at open, held to close. No overnight exposure on entry day. |
-| LONG → LONG (hold) | Close-to-Close (C2C) | Adj Close / Lag(Adj Close) − 1 | Already held at previous close. Earns full overnight gap plus intraday move. |
-| LONG → FLAT (exit) | Close-to-Open (C2O) | Open / Lag(Close) − 1 | Signal flipped overnight. Position sold at open next day — earns only the overnight gap, not the intraday move. |
-
-This decomposition is important because a strategy that always uses C2C returns will overstate performance by crediting entry days with overnight gaps that weren't captured. Equally, using O2C for hold days misses the overnight gap that a real held position earns. The three-way split correctly accounts for each scenario.
-
-O2C and C2O use raw (unadjusted) open and close prices. C2C uses adjusted close for accurate long-horizon compounding.
-
-## 5.6 Transaction Costs
-
-| Component | Assumption | Rationale |
-|---|---|---|
-| Bid-ask spread (one-way) | 0.03% | Liquid sector ETFs trade with ~0.01-0.05% spreads |
-| Commission | 0.02% | Conservative estimate; many brokers now charge $0 |
-| **Total (one-way)** | **0.05%** | Applied as $|\Delta w_i| \times 0.0005$ per dollar rebalanced |
-| Cash return | 0% | Conservative; money market rates not credited |
-| Short sale constraints | N/A | Long-only strategy; no short positions |
-
-Total round-trip cost per sector entry/exit: **0.10%**. Results are reported both gross and net of transaction costs.
-
----
-
-<!-- Implementation chunks run silently below -->
+## Indicators
 
 ```{r}
 #| label: helper_functions
@@ -580,6 +379,15 @@ compute_metrics <- function(port_ret_vec, spy_ret_vec = NULL, n_sectors = 11,
 }
 ```
 
+I apply a Kalman filter to each sector's daily adjusted close price history to extract a noise-filtered trend velocity. The model specification is a local level plus slope (second-order polynomial) state-space model. The two hidden states are the sector's true underlying price level and its velocity — the rate at which that level is changing. Each new daily price updates both estimates in proportion to how surprising the observation was relative to the prior expectation.
+
+Three key assumptions underpin the model. First, linearity: the observation is simply the true level plus noise, which holds well for daily prices. Second, Gaussian noise: both the process disturbances and the measurement error are normally distributed. Equity returns have fat tails, so this is an approximation — but the Kalman filter remains effective as a smoother even when normality is imperfect. Third, stationarity of noise variances: the process noise ($Q_1$, $Q_2$) and observation noise ($R$) are assumed constant over time. In practice volatility regimes shift, which is why $Q_2$ is treated as a free parameter to be optimized rather than fixed arbitrarily.
+
+Three noise variance parameters control filter behavior. $Q_1$ governs how much random variation is allowed in the underlying price level day to day — fixed at a small value since the true level changes smoothly. $Q_2$ controls how quickly the estimated trend velocity can change, and is the most important tuning parameter: a small $Q_2$ produces a slow-reacting velocity with long memory; a large $Q_2$ makes the velocity react more quickly to recent moves. $R$ is the observation noise, fixed at 1.0 to establish the scaling relationship. The ratio $Q_2 / R$ ultimately drives how responsive the velocity estimate is.
+
+A critical distinction: I use `dlmFilter`, the forward-only algorithm, not `dlmSmooth`. The filter estimates the state on day $t$ using only prices observed through day $t$ — exactly how a real-time system would operate. The smoother runs a backward pass through the full series after it has been observed, incorporating future prices to improve past estimates. Using the smoother in a backtest introduces look-ahead bias. Only `dlmFilter` is used here.
+
+The velocity output is the best estimate at each point in time of how fast the sector's underlying trend is moving. A positive and rising velocity means the sector is accelerating upward; a negative velocity means the trend is pointed downward. Compared to raw returns, the Kalman velocity has three advantages as a clustering feature: it absorbs single-day shocks gradually rather than reversing the signal on one bad headline; it places more weight on recent observations when uncertainty is high and more weight on the prior when conditions are stable; and it produces one clean interpretable number per sector per day, avoiding the arbitrary horizon selection required when constructing lookback return features.
 
 ```{r}
 #| label: apply_kalman_train
@@ -618,8 +426,13 @@ spy_ret_train <- spy_train %>%
   select(date, spy_c2c)
 ```
 
+## Signals
 
-## Default Ranking Inspection
+On each trading day, I run k-means clustering on the eleven Kalman velocity values. K-means partitions them into $k$ groups by minimizing total within-cluster variance on that single dimension. The group with the highest mean velocity is the Bull cluster — those sectors receive a LONG signal executed at the following day's open. All other sectors receive a FLAT signal.
+
+Using only the Kalman velocity as the clustering feature keeps the regime classification economically interpretable. The algorithm answers one question: which sectors have the strongest upward trend momentum right now? There is no risk of clustering artifacts from mixing features at different scales, and the result — a hard Bull/non-Bull partition — is straightforward to audit and explain. For a one-dimensional feature with eleven observations per day, k-means is both optimal and efficient; the cluster count $k$ is treated as a free parameter optimized jointly with $Q_2$.
+
+When the 10-year minus 2-year Treasury spread (FRED `T10Y2Y`) falls below −0.25%, the strategy skips clustering entirely and holds 100% cash. Rather than forecasting which sectors will be resilient in a recession, I simply remove all market exposure. This is the most conservative response to a yield curve inversion — it avoids the drawdown from holding risky sectors during a broad market selldown, and the historical evidence for inversion preceding recessions is robust enough to justify the rule without further elaboration.
 
 ```{r}
 #| label: default_ranking_inspection
@@ -661,23 +474,88 @@ plot_ly(
   )
 ```
 
----
+Figure 1 shows which sectors were in the Bull cluster most frequently in each year of the training period under default parameters ($k$ = `r DEFAULT_K`, $Q_2$ = `r DEFAULT_Q_VELOCITY`). Warmer colors indicate more frequent selection. Sectors that dominate in specific years — Energy during oil bull markets, Technology during the 2010s growth cycle — reflect the strategy's momentum-driven nature: it concentrates in whatever is actually trending, rather than allocating based on fixed sector views.
 
-# Parameter Optimization
+The complete daily decision process is summarized in the diagrams below.
 
-The strategy has two free parameters: the number of clusters $k$ and the Kalman velocity process noise $Q_2$. We optimize these jointly by evaluating the **Omega Ratio** of the training-period portfolio across a $4 \times 8 = 32$ parameter grid — $k \in \{2,3,4,5\}$ and $Q_2$ at 8 log-spaced values spanning five orders of magnitude — run in parallel across CPU cores. The finer $Q_2$ grid allows the optimizer to distinguish between subtle differences in filter responsiveness that a coarse 4-value grid would miss.
+```{mermaid}
+%%{init: {'theme': 'base', 'themeVariables': {'primaryColor': '#e3f2fd', 'primaryTextColor': '#0d1b2a', 'primaryBorderColor': '#1565c0', 'lineColor': '#1565c0', 'secondaryColor': '#fff3e0', 'tertiaryColor': '#ffffff'}}}%%
+flowchart TD
+    A([Daily Close]):::start --> B[Apply Kalman Filter\ndlmFilter — forward pass only]
+    B --> C[Extract kal_velocity\nnoise-filtered trend slope]
+    C --> D{Yield curve inverted?\n10Y-2Y < -0.25%}
+    D -- Yes --> E[ALL FLAT\nGo to cash]:::exit
+    D -- No --> F[K-Means Clustering\nk clusters on kal_velocity]
+    F --> G[Identify Bull Cluster\nhighest mean velocity]:::bull
+    G --> H[LONG sectors in Bull Cluster\nequal weight]:::bull
+    E --> I[Apply TC: 0.05%\nper unit weight change]
+    H --> I
+    I --> J([Execute at Open T+1]):::start
+    J --> A
+    classDef start fill:#1565c0,stroke:#0d47a1,color:#ffffff
+    classDef bull  fill:#c8e6c9,stroke:#2e7d32,color:#1b5e20
+    classDef exit  fill:#ffecb3,stroke:#f57f17,color:#4e3400
+```
 
-::: {.callout-warning title="Optimization and Data Snooping"}
-The parameter grid is evaluated exclusively on training data. The test set remains sealed. The 3D surface plot reveals the objective function shape — a broad plateau indicates robustness, while a sharp spike suggests overfitting to the training history.
-:::
+```{mermaid}
+%%{init: {'theme': 'base', 'themeVariables': {'primaryColor': '#e3f2fd', 'primaryTextColor': '#0d1b2a', 'primaryBorderColor': '#1565c0', 'lineColor': '#555555'}}}%%
+flowchart LR
+    D1[Daily OHLCV\ntq_get]:::data --> K[Kalman Filter\ndlmFilter]:::kalman
+    D2[FRED T10Y2Y\nyield spread]:::data --> YC{YC inverted?}:::decision
+    K --> CL[K-Means Clustering\nk clusters on kal_velocity]:::cluster
+    CL --> YC
+    YC -- Yes --> FL[ALL FLAT\nCash]:::exit
+    YC -- No  --> LG[LONG Bull Cluster\nEqual weight]:::bull
+    FL --> PT[Portfolio\nLag 1 day · TC 0.05%]:::port
+    LG --> PT
+    PT --> OP[Grid Search\nk x Q · 60 combos]:::opt
+    OP --> EV[Evaluate\nOmega · Sharpe · MaxDD]:::eval
+    classDef data     fill:#fff8e1,stroke:#f9a825,color:#4e3400
+    classDef kalman   fill:#e3f2fd,stroke:#1565c0,color:#0d47a1
+    classDef cluster  fill:#f3e5f5,stroke:#6a1b9a,color:#4a148c
+    classDef decision fill:#ffffff,stroke:#555555,color:#000000
+    classDef bull     fill:#c8e6c9,stroke:#2e7d32,color:#1b5e20
+    classDef exit     fill:#ffecb3,stroke:#f57f17,color:#4e3400
+    classDef port     fill:#e8eaf6,stroke:#283593,color:#1a237e
+    classDef opt      fill:#fce4ec,stroke:#880e4f,color:#4a0020
+    classDef eval     fill:#e0f2f1,stroke:#00695c,color:#003d36
+```
+
+| Condition | Signal | Execution Timing | Return Captured |
+|---|---|---|---|
+| Yield curve inverted (10Y-2Y < -0.25%) | ALL FLAT | Exit all positions at Open$_{T+1}$ | None (hold cash) |
+| Yield curve normal AND sector in Bull cluster | LONG | Buy at Open$_{T+1}$ | Open-to-Close on $T+1$ |
+| Yield curve normal AND sector NOT in Bull cluster | FLAT | Sell (if held) at Open$_{T+1}$ | None (cash = 0%) |
+
+## Trades
+
+Signals are generated at each day's close and executed at the following day's market open. I observe the cluster assignment at close, place orders overnight, and fill at the open. A position is only entered or exited when the signal actually changes — if a sector stays in the Bull cluster for ten consecutive days, there is no trade on days two through ten.
+
+The return type applied on each day depends on the position transition:
+
+| Transition | Return Type | Formula | Rationale |
+|---|---|---|---|
+| FLAT → LONG (entry) | Open-to-Close (O2C) | Close / Open − 1 | Bought at open, held to close. No overnight exposure on entry day. |
+| LONG → LONG (hold) | Close-to-Close (C2C) | Adj Close / Lag(Adj Close) − 1 | Already held at previous close. Earns full overnight gap plus intraday move. |
+| LONG → FLAT (exit) | Close-to-Open (C2O) | Open / Lag(Close) − 1 | Signal flipped overnight. Position sold at open next day — earns only the overnight gap, not the intraday move. |
+
+This three-way decomposition is important for backtest realism. A strategy that always uses C2C returns overstates performance by crediting entry days with overnight gaps that were not captured. Using O2C for hold days misses the overnight gap that a real held position earns. O2C and C2O use raw unadjusted open and close prices; C2C uses adjusted close for accurate long-horizon compounding.
+
+Transaction costs are 0.05% one-way, applied as $|\Delta w_i| \times 0.0005$ per dollar rebalanced. This covers approximately 0.03% bid-ask spread and 0.02% commission, consistent with liquid sector ETFs. Total round-trip cost per entry/exit is 0.10%. Results are reported both gross and net.
+
+## Training Period
+
+The strategy has two free parameters — $k$ (number of clusters) and $Q_2$ (Kalman velocity noise) — optimized jointly on training data by evaluating the Omega ratio across a 5 × 12 = 60 combination grid. $k$ ranges from 2 to 6; $Q_2$ is evaluated at 12 log-spaced values spanning five orders of magnitude from 0.00001 to 0.1. This fine grid captures subtle differences in filter responsiveness across the full spectrum from very slow (long-memory) to very fast (reactive). The grid runs in parallel across available CPU cores.
+
+I optimize for Omega ratio rather than cumulative return because cumulative return would simply reward parameters that kept the portfolio most invested during the 2009–2021 bull market, penalizing the yield curve cash periods that are the strategy's core risk management mechanism. Omega ratio measures whether the strategy generates more dollar-weighted upside than downside at zero return, accounting for all moments of the distribution rather than just mean and variance as Sharpe does.
 
 ```{r}
 #| label: param_grid_setup
 #| include: false
 
-k_grid     <- K_GRID                                                         # 2, 3, 4, 5
-q_grid     <- c(0.00005, 0.0001, 0.0005, 0.001, 0.005, 0.01, 0.05, 0.1)    # 8 log-spaced values
-param_grid <- expand.grid(k = k_grid, q = q_grid)                            # 4 × 8 = 32 combinations
+k_grid     <- K_GRID                                                                              # 2, 3, 4, 5, 6
+q_grid     <- c(0.00001, 0.00005, 0.0001, 0.0003, 0.0005, 0.001, 0.003, 0.005, 0.01, 0.03, 0.05, 0.1)  # 12 log-spaced values
+param_grid <- expand.grid(k = k_grid, q = q_grid)                                                # 5 × 12 = 60 combinations
 ```
 
 ```{r}
@@ -751,8 +629,6 @@ opt_results <- foreach(
 stopCluster(cl)
 ```
 
-## Omega Ratio Parameter Surface
-
 ```{r}
 #| label: surface_plot_omega
 
@@ -782,7 +658,7 @@ plot_ly(
   )
 ```
 
-## Optimal Parameter Selection
+Figure 2 shows the Omega ratio surface across all 60 parameter combinations. A broad plateau indicates robustness — the strategy performs similarly across a range of parameter values and is not sensitive to the exact grid location of the optimum. A sharp isolated spike would suggest overfitting to a specific historical period.
 
 ```{r}
 #| label: optimal_params
@@ -802,9 +678,7 @@ cat("  Training Omega    :", round(best_row$omega[1], 3), "\n")
 cat("  Training Sharpe   :", round(best_row$sharpe[1], 3), "\n")
 ```
 
-## Z-Scored Risk Metrics Across Parameter Grid
-
-Z-scoring allows visual comparison of metrics that are on different scales. Values > 0 are above average; values > 1 are more than 1 SD above average.
+The optimizer selects $k$ = `r OPTIMAL_K` clusters and $Q_2$ = `r OPTIMAL_Q`. These parameters are frozen and applied without adjustment to the test period.
 
 ```{r}
 #| label: zscored_metrics
@@ -830,14 +704,7 @@ kable(zscored,
   row_spec(1, bold = TRUE, background = "#e3f2fd")
 ```
 
----
-
-# Training Period Results
-
-::: {.callout-note title="In-Sample Performance Caveat"}
-Results in this section are **in-sample** — the model was fit on this same data. In-sample performance is expected to look favorable due to model fitting, and should not be interpreted as an indication of forward-looking performance. The more meaningful evaluation is in Section 9 (Testing Period Results).
-:::
-
+Table 3 z-scores all metrics relative to their grid-wide mean and standard deviation, allowing comparison across metrics that are on different scales. Values above zero are above the grid average; values above 1.0 are more than one standard deviation above average. The top-ranked row is the selected parameter combination.
 
 ```{r}
 #| label: refit_optimal
@@ -871,7 +738,7 @@ train_combined <- portfolio_train %>%
   filter(!is.na(spy_c2c))
 ```
 
-## In-Sample Performance Metrics
+The in-sample results below are presented for transparency and model calibration only. Because the model was fit on this same data, in-sample performance is expected to look favorable and should not be interpreted as a forward-looking forecast.
 
 ```{r}
 #| label: train_metrics_table
@@ -908,7 +775,6 @@ bind_rows(train_metrics_strategy, train_metrics_spy) %>%
   kable_styling(bootstrap_options = c("striped","hover"))
 ```
 
-
 ```{r}
 #| label: train_cum_chart
 
@@ -932,12 +798,9 @@ plot_ly(train_cr, x = ~date) %>%
   )
 ```
 
----
+## Performance
 
-# Testing Period Results
-
-The testing period (January 2025 – March 2026) represents the **true out-of-sample evaluation**. The Kalman filter state carries forward naturally from training — `dlmFilter` processes data sequentially, so applying it to the concatenated price series involves no look-ahead. The optimal parameters (k = `r OPTIMAL_K`, Q = `r OPTIMAL_Q`) are fixed from training. No refitting or parameter adjustment occurs. The test set was not examined at any point prior to this evaluation.
-
+The testing period — January 2025 through March 2026 — is the true out-of-sample evaluation. The Kalman filter state carries forward naturally from training because `dlmFilter` processes data sequentially; applying it to the full concatenated price series involves no look-ahead. The optimal parameters ($k$ = `r OPTIMAL_K`, $Q_2$ = `r OPTIMAL_Q`) are fixed from training. No refitting or parameter adjustment occurs. The test set was not examined at any point prior to this section.
 
 ```{r}
 #| label: build_test_features
@@ -996,8 +859,6 @@ cat("Avg daily positions:", round(mean(test_combined$n_positions), 2), "\n")
 cat("% Days in market:", round(mean(test_combined$n_positions > 0) * 100, 1), "%\n")
 ```
 
-## Out-of-Sample Performance Metrics
-
 ```{r}
 #| label: test_metrics_table
 
@@ -1037,8 +898,6 @@ bind_rows(test_metrics_strategy, test_metrics_spy) %>%
   footnote(general = "Strategy return = Open-to-Close of execution day. SPY = Close-to-Close. TC = 0.05% one-way.")
 ```
 
-## Cumulative Return Chart
-
 ```{r}
 #| label: cum_return_chart
 
@@ -1064,8 +923,6 @@ plot_ly(test_cr, x = ~date) %>%
     legend    = list(x = 0.01, y = 0.99)
   )
 ```
-
-## Performance Dashboard
 
 ```{r}
 #| label: pa_charts
@@ -1118,8 +975,6 @@ subplot(p_ret, p_dd, nrows = 2, shareX = TRUE, titleY = TRUE,
   )
 ```
 
-## Monthly Holdings Summary
-
 ```{r}
 #| label: monthly_holdings
 
@@ -1140,8 +995,6 @@ kable(monthly_holdings,
       format    = "html") %>%
   kable_styling(bootstrap_options = c("striped","hover","condensed"))
 ```
-
-## Sector Positions Over Time
 
 ```{r}
 #| label: positions_chart
@@ -1173,8 +1026,6 @@ plot_ly(
                   tickfont = list(size = 9))
   )
 ```
-
-## Daily P&L
 
 ```{r}
 #| label: daily_pnl_chart
@@ -1216,11 +1067,7 @@ plot_ly(pnl_df, x = ~date) %>%
   )
 ```
 
----
-
-# Correlation Analysis
-
-Understanding the strategy's correlation to SPY is important for portfolio construction. A strategy with low or negative correlation to SPY adds diversification value.
+I also examine rolling correlation to SPY, which measures the strategy's diversification value relative to a passive index. A strategy with low or negative correlation adds something beyond what SPY already provides.
 
 ```{r}
 #| label: rolling_correlation
@@ -1270,13 +1117,7 @@ cat("Average correlation to SPY (test period):",
     round(mean(roll_cor_df$cor_60d, na.rm=TRUE), 3), "\n")
 ```
 
----
-
-# Stress Testing
-
-::: {.callout-warning title="Backtesting Is Not a Scientific Experiment"}
-Stress testing is not statistical proof. We cannot know in advance which historical periods will recur, and the market's response to a strategy changes once the strategy becomes widely known. These tests are presented as **robustness checks** — ways of probing whether the strategy's performance depends critically on specific favorable conditions. They are not forecasts of future resilience.
-:::
+To probe robustness, I run three stress tests on the results. First, doubling transaction costs to 0.10% one-way tests sensitivity to the TC assumption. Second and third, excluding the GFC (2008–2009) and COVID shock (February–June 2020) from the training backtest shows whether the strategy's training-period performance depends critically on those extreme episodes.
 
 ```{r}
 #| label: stress_test_computations
@@ -1362,31 +1203,30 @@ plot_ly(x = ~sc_std$date) %>%
 
 ---
 
-# Conclusion
+# Learnings
 
-## Summary of Results
+## Summary
 
-This project implemented a Kalman-filter-based sector rotation strategy using k-means momentum clustering with a yield curve macro overlay. The strategy was trained on 24.5 years of daily SPDR sector ETF data (June 2000 – December 2024) and evaluated out-of-sample over 15 months (January 2025 – March 2026).
+This project implemented a Kalman-filter-based sector rotation strategy using k-means momentum clustering with a yield curve macro overlay. The strategy was trained on 24.5 years of daily SPDR sector ETF data and evaluated out-of-sample over 15 months. The Kalman filter extracted a noise-filtered trend velocity from daily prices, and k-means partitioned the eleven sectors daily into economically interpretable momentum regimes. The yield curve overlay provided a macro-grounded defensive mechanism, exiting the market entirely during inversion periods rather than requiring a separate sector selection forecast under stress conditions.
 
-The Kalman filter proved effective at extracting noise-filtered trend velocity from daily prices. Clustering sectors monthly on this single velocity signal via k-means partitions the investment universe into economically interpretable momentum regimes — the Bull cluster captures sectors with the strongest trending behavior. The 10Y-2Y yield curve overlay provided a macro-grounded defensive tilt during inversion regimes, adding a fundamental anchor absent from purely technical clustering approaches.
+The two-parameter optimization — $k$ and $Q_2$ jointly via Omega ratio on training data — produced a clean and interpretable optimal configuration. The Omega ratio objective avoided the trap of optimizing for cumulative return, which would have overfit to the 2009–2021 bull market at the expense of the defensive cash periods the yield curve filter is designed to produce.
 
 ## Limitations
 
-**Single macro signal**: The yield curve overlay uses one FRED series (10Y-2Y spread) with a fixed threshold (-0.25%). Yield curve inversion is a strong but lagging recession predictor — the inversion-to-recession lag historically ranges from 6 to 24 months, meaning the defensive rotation may activate prematurely or persist too long.
+The yield curve overlay uses one FRED series with a fixed threshold. Yield curve inversion is a strong but lagging recession predictor — the inversion-to-recession lag historically ranges from 6 to 24 months, meaning the defensive rotation may activate prematurely or persist too long relative to actual market drawdowns.
 
-**Cluster instability**: K-means can produce different cluster assignments across runs due to random centroid initialization (mitigated here with `nstart = 25`). More critically, sectors near cluster boundaries can flip between Bull and non-Bull assignments on small velocity changes, generating unnecessary trades. Soft clustering methods (Gaussian Mixture Models) that produce membership probabilities rather than hard assignments could reduce boundary sensitivity.
+K-means produces hard cluster assignments, and sectors near cluster boundaries can flip between Bull and non-Bull on small velocity changes, generating unnecessary trades even with `nstart = 25` to stabilize centroid initialization. Soft clustering methods like Gaussian Mixture Models would provide probabilistic membership and could reduce this boundary sensitivity.
 
-**Static optimization**: Optimal parameters ($k$ and $Q$) are estimated once on the full training period and applied statically to the test period. A walk-forward approach — re-optimizing quarterly on a rolling window — would be more realistic and reduce the risk of regime-change invalidation.
+The parameters are optimized once on the full training period and applied statically to the test period. A walk-forward approach — re-optimizing quarterly on a rolling window — would be more realistic and reduce the risk of regime-change invalidation as market conditions evolve.
 
-**Equal weighting**: Held sectors are equally weighted regardless of velocity magnitude within the Bull cluster. Velocity-proportional weighting would concentrate exposure on the strongest-trending sectors.
+Held sectors are equally weighted regardless of velocity magnitude within the Bull cluster. Velocity-proportional weighting would concentrate exposure on the strongest-trending sectors within the cluster rather than distributing it uniformly.
 
-**Out-of-sample period length**: Fifteen months is a short evaluation window. A single bull or bear market regime during this period will dominate the results. Definitive conclusions about strategy robustness require multiple market cycles.
+The 15-month test window is short. A single bull or bear market regime during this period will dominate the results. Definitive conclusions about strategy robustness require multiple market cycles.
 
 ## Future Work
 
-- **Walk-forward backtesting**: Re-optimize $k$ and $Q$ quarterly on rolling 36-month windows
-- **Soft clustering**: Replace k-means with Gaussian Mixture Models for probabilistic Bull cluster membership; weight positions by membership probability
-- **Multi-feature clustering**: Extend beyond single-feature velocity clustering by adding yield-spread sensitivity or realized volatility as additional clustering dimensions
-- **Additional macro filters**: Credit spreads (HYG/LQD ratio), ISM PMI, or Fed funds futures to complement yield curve signal
-- **Volatility scaling**: Scale position size inversely to realized volatility (as in Moskowitz, Ooi & Pedersen 2012) to stabilize portfolio risk through regimes
-
+- **Walk-forward backtesting**: Re-optimize $k$ and $Q_2$ quarterly on rolling 36-month windows to adapt to regime shifts
+- **Soft clustering**: Replace k-means with Gaussian Mixture Models; weight positions by Bull cluster membership probability
+- **Multi-feature clustering**: Extend beyond single-feature velocity clustering by adding yield-spread sensitivity or realized volatility as additional dimensions
+- **Additional macro filters**: Credit spreads (HYG/LQD ratio), ISM PMI, or Fed funds futures to complement the yield curve signal
+- **Volatility scaling**: Scale position size inversely to realized volatility, as in Moskowitz, Ooi & Pedersen (2012), to stabilize portfolio risk through regimes
