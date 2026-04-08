@@ -115,7 +115,7 @@ The core intuition is that equity sectors exhibit persistent momentum. Sectors t
 
 The Kalman filter's role is noise reduction before clustering. Raw daily returns are dominated by single-day shocks — macro headlines, fund flows, temporary imbalances — that do not reflect genuine trend reversals. Clustering on raw returns generates excessive turnover as sectors bounce in and out of the Bull cluster on noise rather than signal. The Kalman velocity filters out these transient shocks by maintaining a running estimate of each sector's underlying trend speed, updating conservatively when a new price is consistent with the prior trend and more aggressively when a sustained directional move accumulates. Clustering on this denoised velocity produces more stable daily assignments and lower unnecessary turnover.
 
-The yield curve overlay provides a macro-grounded defensive mechanism. Rather than trying to pick which sectors will hold up in a recessionary environment — a second prediction problem layered on top of the momentum signal — I simply exit the market entirely when the probability of a broad economic contraction is elevated. The 10Y-2Y spread has preceded every US recession since the 1960s, making it the cleanest and most widely-validated leading indicator available at daily frequency without data access costs.
+The yield curve overlay provides a macro-grounded defensive mechanism. Rather than trying to pick which sectors will hold up in a recessionary environment — a second prediction problem layered on top of the momentum signal — I simply exit the market entirely when the probability of a broad economic contraction is elevated. The 10Y-2Y spread has been a reliable leading indicator historically predicting US recessions, making it the cleanest and most widely-validated signal available.
 
 ## Research
 
@@ -154,7 +154,7 @@ yc_raw <- tq_get(
   mutate(yield_spread = yield_spread / 100)   # convert from percentage points to decimal
 ```
 
-I download daily OHLC price data for all eleven sector ETFs and SPY from Yahoo Finance using `tidyquant::tq_get()`, and the FRED T10Y2Y series for the yield curve overlay. XLC (Communication Services) launched on `r format(XLC_LAUNCH, "%B %d, %Y")` and XLRE (Real Estate) launched on `r format(XLRE_LAUNCH, "%B %d, %Y")`; prior to those dates those sectors are simply absent from the clustering universe, and k-means operates on the available subset.
+I download daily OHLC price data for all eleven sector ETFs and SPY from Yahoo Finance, and the FRED T10Y2Y series for the yield curve overlay. XLC (Communication Services) launched on `r format(XLC_LAUNCH, "%B %d, %Y")` and XLRE (Real Estate) launched on `r format(XLRE_LAUNCH, "%B %d, %Y")`; prior to those dates those sectors are simply absent from the clustering universe, and k-means operates on the available subset.
 
 ```{r}
 #| label: data_quality
@@ -179,7 +179,7 @@ kable(coverage,
   row_spec(which(coverage$symbol %in% c("XLC","XLRE")), background = "#fff3cd")
 ```
 
-I use the `adjusted` close from Yahoo Finance for the Kalman filter and C2C returns. Yahoo computes adjusted prices using the full forward history of dividends and splits, which introduces a minor look-ahead bias in the feature engineering. This is standard practice in academic finance and the impact is small for sector ETFs, which pay modest quarterly dividends and rarely split.
+I use the adjusted close from Yahoo Finance for the Kalman filter and C2C returns. Yahoo computes adjusted prices using the full forward history of dividends and splits, which introduces a minor look-ahead bias in the feature engineering. This is standard practice in academic finance and the impact is small for sector ETFs, which pay modest quarterly dividends and rarely split.
 
 ```{r}
 #| label: data_split
@@ -394,7 +394,7 @@ compute_metrics <- function(port_ret_vec, spy_ret_vec = NULL, n_sectors = 11,
 }
 ```
 
-I apply a Kalman filter (`dlmFilter`, forward-only — not `dlmSmooth`) to each sector's daily adjusted close price. The model is a local level plus slope (second-order polynomial) state-space, tracking two hidden states: the sector's underlying price **level** and its **velocity** — the rate of change of that level. Each new daily price updates both estimates in proportion to how surprising it was relative to the prior.
+I apply a Kalman filter (forward-only — not a Kalman smoother that uses future data) to each sector's daily adjusted close price. The model is a local level plus slope (second-order polynomial) state-space, tracking two hidden states: the sector's underlying price **level** and its **velocity** — the rate of change of that level. Each new daily price updates both estimates in proportion to how surprising it was relative to the prior.
 
 The key tuning parameter is $Q_2$, the velocity process noise. A small $Q_2$ produces a slow-reacting, long-memory velocity; a large $Q_2$ makes it more reactive to recent moves. This parameter is optimized jointly with $k$ in the grid search. $Q_1$ (level noise) and $R$ (observation noise) are fixed.
 
@@ -526,7 +526,7 @@ Transaction costs are 0.05% one-way ($|\Delta w_i| \times 0.0005$), covering est
 
 ## Training Period
 
-The strategy has two free parameters — $k$ (number of clusters) and $Q_2$ (Kalman velocity noise) — optimized jointly on training data by evaluating the Omega ratio across a 5 × 12 = 60 combination grid. $k$ ranges from 2 to 6; $Q_2$ is evaluated at 12 log-spaced values from $1 \times 10^{-5}$ to $1 \times 10^{-1}$ (0.00001 to 0.1). Because these values span five orders of magnitude, the optimization surface is plotted on a log₁₀ scale — so the x-axis runs from −5 to −1, where each tick represents a tenfold change in $Q_2$. The grid runs in parallel across available CPU cores.
+The strategy has two free parameters — $k$ (number of clusters) and $Q_2$ (Kalman velocity noise) — optimized jointly on training data by evaluating the Omega ratio across a 5 × 12 = 60 combination grid. $k$ ranges from 2 to 6; $Q_2$ is evaluated at 12 log-spaced values from $1 \times 10^{-5}$ to $1 \times 10^{-1}$ (0.00001 to 0.1). Because these values span five orders of magnitude, the optimization surface is plotted on a log₁₀ scale — so the x-axis runs from −5 to −1, where each tick represents a tenfold change in $Q_2$.
 
 I optimize for Omega ratio rather than cumulative return because cumulative return would simply reward parameters that kept the portfolio most invested during the 2009–2021 bull market, penalizing the yield curve cash periods that are the strategy's core risk management mechanism. Omega ratio measures whether the strategy generates more dollar-weighted upside than downside at zero return, accounting for all moments of the distribution rather than just mean and variance as Sharpe does.
 
@@ -694,7 +694,7 @@ train_combined <- portfolio_train %>%
   filter(!is.na(spy_c2c))
 ```
 
-The in-sample results below are presented for transparency and model calibration only. Because the model was fit on this same data, in-sample performance is expected to look favorable and should not be interpreted as a forward-looking forecast.
+The in-sample results below are presented for transparency and model calibration only.
 
 ```{r}
 #| label: train_metrics_table
@@ -756,7 +756,7 @@ plot_ly(train_cr, x = ~date) %>%
 
 ## Performance
 
-The testing period — January 2025 through March 2026 — is the true out-of-sample evaluation. The Kalman filter state carries forward naturally from training because `dlmFilter` processes data sequentially; applying it to the full concatenated price series involves no look-ahead. The optimal parameters ($k$ = `r OPTIMAL_K`, $Q_2$ = `r OPTIMAL_Q`) are fixed from training. No refitting or parameter adjustment occurs. The test set was not examined at any point prior to this section.
+The testing period — January 2025 through March 2026 — is the true out-of-sample evaluation. The Kalman filter state carries forward naturally from training due to it processing the data sequentially; applying it to the full concatenated price series involves no look-ahead. The optimal parameters ($k$ = `r OPTIMAL_K`, $Q_2$ = `r OPTIMAL_Q`) are fixed from training. No refitting or parameter adjustment occurs. The test set was not examined at any point prior to this section.
 
 ```{r}
 #| label: build_test_features
@@ -965,7 +965,10 @@ p_tile <- ggplot(pos_tile, aes(x = date, y = sector_name, fill = held)) +
   )
 
 ggplotly(p_tile, tooltip = c("x", "sector_name", "fill")) %>%
-  layout(legend = list(orientation = "h", x = 0, y = 1.1))
+  layout(
+    legend = list(orientation = "h", x = 0.35, y = -0.2),
+    margin = list(b = 80)
+  )
 ```
 
 I also examine rolling correlation to SPY, which measures the strategy's diversification value relative to a passive index. A strategy with low or negative correlation adds something beyond what SPY already provides.
@@ -1018,7 +1021,9 @@ cat("Average correlation to SPY (test period):",
     round(mean(roll_cor_df$cor_60d, na.rm=TRUE), 3), "\n")
 ```
 
-To probe robustness, I run three stress tests on the results. First, doubling transaction costs to 0.10% one-way tests sensitivity to the TC assumption. Second and third, excluding the GFC (2008–2009) and COVID shock (February–June 2020) from the training backtest shows whether the strategy's training-period performance depends critically on those extreme episodes.
+## Stress Testing
+
+To test robustness, I ran three stress tests on the results. First, doubling transaction costs to 0.10% one-way tests sensitivity to the TC assumption. Second and third, excluding the GFC (2008–2009) and COVID shock (February–June 2020) from the training backtest shows whether the strategy's training-period performance depends critically on those extreme episodes.
 
 ```{r}
 #| label: stress_test_computations
@@ -1161,17 +1166,9 @@ plot_ly() %>%
 
 ---
 
-# Learnings
-
-## Summary
-
-This project implemented a Kalman-filter-based sector rotation strategy using k-means momentum clustering with a yield curve macro overlay. The strategy was trained on 24.5 years of daily SPDR sector ETF data and evaluated out-of-sample over 15 months. The Kalman filter extracted a noise-filtered trend velocity from daily prices, and k-means partitioned the eleven sectors daily into economically interpretable momentum regimes. The yield curve overlay provided a macro-grounded defensive mechanism, exiting the market entirely during inversion periods rather than requiring a separate sector selection forecast under stress conditions.
-
-The two-parameter optimization — $k$ and $Q_2$ jointly via Omega ratio on training data — produced a clean and interpretable optimal configuration. The Omega ratio objective avoided the trap of optimizing for cumulative return, which would have overfit to the 2009–2021 bull market at the expense of the defensive cash periods the yield curve filter is designed to produce.
-
 ## Limitations
 
-The yield curve overlay uses one FRED series with a fixed threshold. Yield curve inversion is a strong but lagging recession predictor — the inversion-to-recession lag historically ranges from 6 to 24 months, meaning the defensive rotation may activate prematurely or persist too long relative to actual market drawdowns.
+The yield curve overlay uses one FRED series with a fixed threshold. Yield curve inversion is a strong but lagging recession predictor — the inversion-to-recession lag historically ranges from 6 to 18 months, meaning the defensive rotation may activate prematurely or persist too long relative to actual market drawdowns.
 
 K-means produces hard cluster assignments, and sectors near cluster boundaries can flip between Bull and non-Bull on small velocity changes, generating unnecessary trades even with `nstart = 25` to stabilize centroid initialization. Soft clustering methods like Gaussian Mixture Models would provide probabilistic membership and could reduce this boundary sensitivity.
 
@@ -1185,6 +1182,6 @@ The 15-month test window is short. A single bull or bear market regime during th
 
 - **Walk-forward backtesting**: Re-optimize $k$ and $Q_2$ quarterly on rolling 36-month windows to adapt to regime shifts
 - **Soft clustering**: Replace k-means with Gaussian Mixture Models; weight positions by Bull cluster membership probability
-- **Multi-feature clustering**: Extend beyond single-feature velocity clustering by adding yield-spread sensitivity or realized volatility as additional dimensions
+- **Realized volatility as a second clustering feature**: The current clustering operates on Kalman velocity alone, and relies on $Q_2$ to filter temporal noise in the velocity estimate. However, $Q_2$ addresses smoothness over time only — the observation noise $R$ is fixed at 1.0 across all eleven sectors, meaning the Kalman filter applies uniform noise assumptions regardless of each sector's actual return dispersion. Adding realized volatility (e.g., 20-day rolling standard deviation) as a second feature would let the cluster geometry distinguish clean uptrends from erratic ones with similar mean velocity. This requires z-scoring both features before clustering to prevent realized volatility from dominating the Euclidean distance metric, and would likely shift the optimal $Q_2$ upward since some noise-filtering responsibility transfers to the volatility dimension explicitly.
 - **Additional macro filters**: Credit spreads (HYG/LQD ratio), ISM PMI, or Fed funds futures to complement the yield curve signal
 - **Volatility scaling**: Scale position size inversely to realized volatility, as in Moskowitz, Ooi & Pedersen (2012), to stabilize portfolio risk through regimes
