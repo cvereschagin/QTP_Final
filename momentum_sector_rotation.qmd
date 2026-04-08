@@ -645,14 +645,20 @@ Figure 2 shows the Omega ratio surface across all 60 parameter combinations. A b
 #| label: optimal_params
 #| include: false
 
+# Global optimum (k=2) sits at a steep isolated peak on the Omega surface —
+# high in-sample Omega but surrounded by sharp drop-offs, indicating fragility.
+# k=3 lies in a broader plateau region, is more robust to small parameter
+# perturbations, and produces a more selective Bull cluster (3 regimes vs 2).
+# OPTIMAL_K is fixed at 3; OPTIMAL_Q is selected as the best Q within k=3
+# so it remains data-driven from the plateau rather than the spike.
 best_row <- opt_results %>%
-  filter(!is.na(omega)) %>%
+  filter(!is.na(omega), k == 3) %>%
   slice_max(omega, n = 1)
 
-OPTIMAL_K <- best_row$k[1]
+OPTIMAL_K <- 3L
 OPTIMAL_Q <- best_row$q[1]
 
-cat("Optimal parameters (training Omega criterion):\n")
+cat("Optimal parameters (training Omega criterion, k constrained to 3):\n")
 cat("  k (clusters)         :", OPTIMAL_K, "\n")
 cat("  Q2 (velocity noise)  :", formatC(OPTIMAL_Q, format = "e", digits = 1),
     sprintf("  [log10 = %.1f]", log10(OPTIMAL_Q)), "\n")
@@ -660,7 +666,7 @@ cat("  Training Omega       :", round(best_row$omega[1], 3), "\n")
 cat("  Training Sharpe      :", round(best_row$sharpe[1], 3), "\n")
 ```
 
-The optimizer selects $k$ = `r OPTIMAL_K` clusters and $Q_2$ = `r formatC(OPTIMAL_Q, format = "e", digits = 1)` (log₁₀ = `r round(log10(OPTIMAL_Q), 1)`). These parameters are frozen and applied without adjustment to the test period.
+The global Omega maximum occurs at $k$ = 2, but that point sits at a steep, isolated peak on the surface — surrounded by sharp drop-offs that indicate fragility rather than robustness. $k$ = 3 lies in a broader plateau region of the surface, producing similar Omega values across a wider range of $Q_2$ values and partitioning sectors into three interpretable momentum regimes (strong uptrend, neutral, downtrend) rather than a coarse binary split. Accordingly, $k$ is fixed at 3 and $Q_2$ is selected as the best value within that row of the surface: $Q_2$ = `r formatC(OPTIMAL_Q, format = "e", digits = 1)` (log₁₀ = `r round(log10(OPTIMAL_Q), 1)`). These parameters are frozen and applied without adjustment to the test period.
 
 ```{r}
 #| label: refit_optimal
